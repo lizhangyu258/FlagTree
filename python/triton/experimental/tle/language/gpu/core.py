@@ -472,8 +472,6 @@ def local_ptr(
     result_tensor = tl.tensor(local_ptr_op.get_result(0), result_ty)
 
     if remote_buffer_marker:
-        if all_scalar_indices:
-            raise ValueError("local_ptr does not yet support scalar indices on remote buffers")
         # Keep remote semantics attached to the source buffered tensor and
         # materialize them only when pointer view is requested.
         from triton.experimental.tle import distributed as _tled_distributed
