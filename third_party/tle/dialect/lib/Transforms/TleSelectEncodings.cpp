@@ -25,6 +25,8 @@
 #include "tle/dialect/include/IR/Dialect.h"
 #include "tle/dialect/include/Transforms/Passes.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -35,7 +37,7 @@
 
 namespace mlir::triton::tle {
 
-#define GEN_PASS_DEF_TRITONTLEASSIGNLOCALPOINTERSENCODING
+#define GEN_PASS_DEF_TRITONTLESELECTENCODINGS
 #include "tle/dialect/include/Transforms/Passes.h.inc"
 
 namespace {
@@ -46,6 +48,185 @@ constexpr StringLiteral kBarrierGroupAttr = "tle.barrier_group";
 constexpr StringLiteral kTTContiguityAttr = "tt.contiguity";
 constexpr StringLiteral kTTDivisibilityAttr = "tt.divisibility";
 constexpr StringLiteral kTTConstancyAttr = "tt.constancy";
+
+static Value stripConvertLayouts(Value value) {
+  Value current = value;
+  while (auto convert = current.getDefiningOp<triton::gpu::ConvertLayoutOp>())
+    current = convert.getSrc();
+  return current;
+}
+
+static Value stripIndexValueWrappers(Value value) {
+  Value current = value;
+  while (true) {
+    if (auto convert = current.getDefiningOp<triton::gpu::ConvertLayoutOp>()) {
+      current = convert.getSrc();
+      continue;
+    }
+    if (auto ext = current.getDefiningOp<arith::ExtSIOp>()) {
+      current = ext.getIn();
+      continue;
+    }
+    if (auto ext = current.getDefiningOp<arith::ExtUIOp>()) {
+      current = ext.getIn();
+      continue;
+    }
+    if (auto trunc = current.getDefiningOp<arith::TruncIOp>()) {
+      current = trunc.getIn();
+      continue;
+    }
+    if (auto cast = current.getDefiningOp<arith::IndexCastOp>()) {
+      current = cast.getIn();
+      continue;
+    }
+    break;
+  }
+  return current;
+}
+
+static bool matchZeroStartMakeRange(Value value, int64_t extent) {
+  Value current = stripIndexValueWrappers(value);
+  auto range = current.getDefiningOp<triton::MakeRangeOp>();
+  if (!range)
+    return false;
+  return range.getStart() == 0 && range.getEnd() == extent;
+}
+
+static bool matchFullIndexTensorForAxis(Value index, size_t axis,
+                                        ArrayRef<int64_t> shape) {
+  auto indexTy = dyn_cast<RankedTensorType>(index.getType());
+  if (!indexTy || !indexTy.getElementType().isInteger())
+    return false;
+  if (indexTy.getShape() != shape)
+    return false;
+
+  Value current = stripIndexValueWrappers(index);
+  if (shape.size() == 1)
+    return matchZeroStartMakeRange(current, shape.front());
+
+  auto bcast = current.getDefiningOp<triton::BroadcastOp>();
+  if (!bcast)
+    return false;
+
+  auto bcastSrcTy = dyn_cast<RankedTensorType>(bcast.getSrc().getType());
+  if (!bcastSrcTy || bcastSrcTy.getRank() != static_cast<int64_t>(shape.size()))
+    return false;
+  for (auto [dim, dimSize] : llvm::enumerate(shape)) {
+    const int64_t expected = dim == axis ? dimSize : 1;
+    if (bcastSrcTy.getShape()[dim] != expected)
+      return false;
+  }
+
+  current = stripIndexValueWrappers(bcast.getSrc());
+  while (auto expand = current.getDefiningOp<triton::ExpandDimsOp>())
+    current = stripIndexValueWrappers(expand.getSrc());
+
+  auto rangeTy = dyn_cast<RankedTensorType>(current.getType());
+  if (!rangeTy || rangeTy.getRank() != 1)
+    return false;
+  if (rangeTy.getShape()[0] != shape[axis])
+    return false;
+
+  return matchZeroStartMakeRange(current, shape[axis]);
+}
+
+// Loads of full-view local_pointers are later rewritten to ttg.local_load.
+// They should not bias local_pointers encoding inference toward load layouts.
+static bool isRewritableFullViewLocalPointerLoad(triton::LoadOp load) {
+  if (load.getMask() || load.getOther())
+    return false;
+  if (load.getIsVolatile())
+    return false;
+  if (load.getCache() != triton::CacheModifier::NONE ||
+      load.getEvict() != triton::EvictionPolicy::NORMAL)
+    return false;
+
+  auto loadTy = dyn_cast<RankedTensorType>(load.getType());
+  if (!loadTy)
+    return false;
+
+  Value ptr = stripConvertLayouts(load.getPtr());
+  auto localPointers = ptr.getDefiningOp<triton::tle::LocalPointersOp>();
+  if (!localPointers)
+    return false;
+
+  auto ptrTy = dyn_cast<RankedTensorType>(localPointers.getResult().getType());
+  if (!ptrTy)
+    return false;
+
+  auto memDescTy = dyn_cast<triton::gpu::MemDescType>(localPointers.getSrc().getType());
+  if (!memDescTy)
+    return false;
+
+  auto memDescShape = memDescTy.getShape();
+  if (loadTy.getShape() != memDescShape || ptrTy.getShape() != memDescShape)
+    return false;
+  if (loadTy.getElementType() != memDescTy.getElementType())
+    return false;
+
+  auto indices = localPointers.getIndices();
+  if (indices.empty())
+    return true;
+  if (indices.size() != memDescShape.size())
+    return false;
+
+  for (auto [axis, index] : llvm::enumerate(indices))
+    if (!matchFullIndexTensorForAxis(index, axis, memDescShape))
+      return false;
+  return true;
+}
+
+static int64_t getScfLoopDepth(Operation *op) {
+  int64_t depth = 0;
+  for (Operation *cur = op; cur; cur = cur->getParentOp())
+    if (isa<scf::ForOp>(cur))
+      ++depth;
+  return depth;
+}
+
+static bool valueFeedsDot(Value root) {
+  llvm::SmallVector<Value> worklist;
+  llvm::DenseSet<Value> visited;
+  auto enqueue = [&](Value v) {
+    if (v && visited.insert(v).second)
+      worklist.push_back(v);
+  };
+  enqueue(root);
+  while (!worklist.empty()) {
+    Value current = worklist.pop_back_val();
+    for (OpOperand &use : current.getUses()) {
+      Operation *owner = use.getOwner();
+      if (isa<triton::DotOpInterface>(owner))
+        return true;
+      if (auto convert = dyn_cast<triton::gpu::ConvertLayoutOp>(owner)) {
+        enqueue(convert.getResult());
+        continue;
+      }
+      if (auto trans = dyn_cast<triton::TransOp>(owner)) {
+        enqueue(trans.getResult());
+        continue;
+      }
+      if (auto bcast = dyn_cast<triton::BroadcastOp>(owner)) {
+        enqueue(bcast.getResult());
+        continue;
+      }
+      if (auto expand = dyn_cast<triton::ExpandDimsOp>(owner)) {
+        enqueue(expand.getResult());
+        continue;
+      }
+      if (auto reshape = dyn_cast<triton::ReshapeOp>(owner)) {
+        enqueue(reshape.getResult());
+        continue;
+      }
+    }
+  }
+  return false;
+}
+
+struct EncodingVote {
+  Attribute encoding;
+  int64_t score;
+};
 
 static Operation *peelAxisInfoCarrier(Value value) {
   llvm::DenseSet<Value> visited;
@@ -90,9 +271,8 @@ static void copyAxisInfoAttrs(Operation *src, Operation *dst) {
 }
 
 static void
-collectConsumerEncodings(Value root,
-                         llvm::SmallVectorImpl<Attribute> &loadEncodings,
-                         llvm::SmallVectorImpl<Attribute> &storeEncodings) {
+collectConsumerEncodingVotes(Value root,
+                             llvm::SmallVectorImpl<EncodingVote> &votes) {
   llvm::SmallVector<Value> worklist;
   llvm::DenseSet<Value> visited;
   auto enqueue = [&](Value v) {
@@ -109,15 +289,28 @@ collectConsumerEncodings(Value root,
     for (OpOperand &use : current.getUses()) {
       Operation *owner = use.getOwner();
       if (auto load = dyn_cast<triton::LoadOp>(owner)) {
+        if (isRewritableFullViewLocalPointerLoad(load))
+          continue;
         auto loadTy = dyn_cast<RankedTensorType>(load.getResult().getType());
-        if (loadTy && loadTy.getEncoding())
-          loadEncodings.push_back(loadTy.getEncoding());
+        if (loadTy && loadTy.getEncoding()) {
+          const int64_t depthFactor = 1 + getScfLoopDepth(owner);
+          int64_t score = 8 * depthFactor;
+          if (valueFeedsDot(load.getResult()))
+            score += 128 * depthFactor;
+          votes.push_back({loadTy.getEncoding(), score});
+        }
         continue;
       }
       if (auto store = dyn_cast<triton::StoreOp>(owner)) {
         auto valueTy = dyn_cast<RankedTensorType>(store.getValue().getType());
-        if (valueTy && valueTy.getEncoding())
-          storeEncodings.push_back(valueTy.getEncoding());
+        if (valueTy && valueTy.getEncoding()) {
+          const int64_t depthFactor = 1 + getScfLoopDepth(owner);
+          int64_t score = 2 * depthFactor;
+          if (Operation *def = store.getValue().getDefiningOp();
+              def && isa<triton::DotOpInterface>(def))
+            score += 8 * depthFactor;
+          votes.push_back({valueTy.getEncoding(), score});
+        }
         continue;
       }
       if (auto convert = dyn_cast<triton::gpu::ConvertLayoutOp>(owner)) {
@@ -144,9 +337,41 @@ collectConsumerEncodings(Value root,
   }
 }
 
-class AssignLocalPointersEncodingPass
-    : public impl::TritonTleAssignLocalPointersEncodingBase<
-          AssignLocalPointersEncodingPass> {
+static Attribute pickDominantEncoding(ArrayRef<EncodingVote> votes,
+                                      Attribute fallback) {
+  if (votes.empty())
+    return fallback;
+
+  llvm::DenseMap<Attribute, int64_t> scoreByEncoding;
+  llvm::SmallVector<Attribute> order;
+  for (const EncodingVote &vote : votes) {
+    if (!vote.encoding)
+      continue;
+    auto [it, inserted] = scoreByEncoding.try_emplace(vote.encoding, 0);
+    if (inserted)
+      order.push_back(vote.encoding);
+    it->second += vote.score;
+  }
+  if (order.empty())
+    return fallback;
+
+  Attribute best = order.front();
+  int64_t bestScore = scoreByEncoding.lookup(best);
+  for (Attribute encoding : order) {
+    int64_t score = scoreByEncoding.lookup(encoding);
+    if (score > bestScore) {
+      best = encoding;
+      bestScore = score;
+      continue;
+    }
+    if (score == bestScore && encoding == fallback)
+      best = encoding;
+  }
+  return best;
+}
+
+class SelectEncodingsPass
+    : public impl::TritonTleSelectEncodingsBase<SelectEncodingsPass> {
   void runOnOperation() override {
     ModuleOp module = getOperation();
     OpBuilder builder(module.getContext());
@@ -181,27 +406,9 @@ class AssignLocalPointersEncodingPass
       }
 
       auto encoding = tensorTy.getEncoding();
-      Attribute userEncoding;
-      SmallVector<Attribute> loadConsumerEncodings;
-      SmallVector<Attribute> storeConsumerEncodings;
-      collectConsumerEncodings(op.getResult(), loadConsumerEncodings,
-                               storeConsumerEncodings);
-      auto pickConsistentEncoding =
-          [](ArrayRef<Attribute> encodings) -> Attribute {
-        Attribute selected;
-        for (Attribute enc : encodings) {
-          if (!selected)
-            selected = enc;
-          else if (selected != enc)
-            return Attribute();
-        }
-        return selected;
-      };
-      // Pointer tensor encoding should follow load consumers first; stores can
-      // be bridged via convert_layout on the value path.
-      userEncoding = pickConsistentEncoding(loadConsumerEncodings);
-      if (!userEncoding)
-        userEncoding = pickConsistentEncoding(storeConsumerEncodings);
+      SmallVector<EncodingVote> votes;
+      collectConsumerEncodingVotes(op.getResult(), votes);
+      Attribute userEncoding = pickDominantEncoding(votes, encoding);
       if (userEncoding && userEncoding != encoding) {
         encoding = userEncoding;
         updated = true;
@@ -255,6 +462,8 @@ class AssignLocalPointersEncodingPass
           for (OpOperand &use : ptrVal.getUses()) {
             Operation *owner = use.getOwner();
             if (auto load = dyn_cast<triton::LoadOp>(owner)) {
+              if (isRewritableFullViewLocalPointerLoad(load))
+                continue;
               if (Value mask = load.getMask()) {
                 Value convertedMask =
                     convertOperandEncoding(owner, mask, ptrEncoding);

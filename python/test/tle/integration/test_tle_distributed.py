@@ -274,6 +274,26 @@ def _remote_rank0_dsmem_atomic_add_kernel(out_ptr, mesh: tl.constexpr):
 
 
 @triton.jit
+def _remote_rank0_dsmem_scalar_ptr_atomic_add_kernel(out_ptr, mesh: tl.constexpr):
+    rank = tle.shard_id(mesh, "cluster_x")
+    smem = tle.gpu.alloc([1], dtype=tl.int32, layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=False)
+    local_scalar_ptr = tle.gpu.local_ptr(smem, (0, ))
+
+    if rank == 0:
+        tl.store(local_scalar_ptr, 0)
+    tle.distributed_barrier(mesh)
+
+    remote_rank0 = tle.remote(smem, 0, scope=mesh)
+    remote_scalar_ptr = tle.gpu.local_ptr(remote_rank0, (0, ))
+    tl.atomic_add(remote_scalar_ptr, 1, sem="relaxed", scope="cta")
+    tle.distributed_barrier(mesh)
+
+    if rank == 0:
+        counter = tl.load(local_scalar_ptr)
+        tl.store(out_ptr, counter)
+
+
+@triton.jit
 def _remote_scan_shared_scratch_kernel(out_ptr, mesh: tl.constexpr, BLOCK: tl.constexpr):
     rank = tle.shard_id(mesh, "cluster_x")
     offs = tl.arange(0, BLOCK)
@@ -1075,6 +1095,32 @@ class TestTLEDistributed:
         out = torch.empty((1, ), device="cuda", dtype=torch.int32)
         for _ in range(512):
             _remote_rank0_dsmem_atomic_add_kernel[(1, )](
+                out,
+                mesh=BLOCK_CLUSTER_MESH_8,
+                num_ctas=1,
+                num_warps=4,
+            )
+            torch.cuda.synchronize()
+            assert int(out.item()) == 8
+
+    def test_remote_rank0_dsmem_scalar_ptr_atomic_add_lowering_cluster8(self):
+        out = torch.empty((1, ), device="cuda", dtype=torch.int32)
+        compiled = _remote_rank0_dsmem_scalar_ptr_atomic_add_kernel.warmup(
+            out,
+            mesh=BLOCK_CLUSTER_MESH_8,
+            grid=(1, ),
+            num_ctas=1,
+            num_warps=4,
+        )
+        assert compiled.metadata.cluster_dims == (8, 1, 1)
+        ptx = compiled.asm["ptx"]
+        assert "atom.shared::cluster.cta.relaxed.add.u32" in ptx
+        assert "atom.shared.shared::cluster" not in ptx
+
+    def test_remote_rank0_dsmem_scalar_ptr_atomic_add_runtime_cluster8_stable(self):
+        out = torch.empty((1, ), device="cuda", dtype=torch.int32)
+        for _ in range(512):
+            _remote_rank0_dsmem_scalar_ptr_atomic_add_kernel[(1, )](
                 out,
                 mesh=BLOCK_CLUSTER_MESH_8,
                 num_ctas=1,

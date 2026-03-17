@@ -130,29 +130,61 @@ struct LocalPointersOpConversion
       return reportFailure("shared memory offsets rank mismatch");
 
     auto indexVals = adaptor.getIndices();
-    if (indexVals.size() != bufferRank)
-      return reportFailure("indices must provide buffer-rank values");
+    const bool hasExplicitIndices = !indexVals.empty();
+    if (hasExplicitIndices) {
+      if (indexVals.size() != bufferRank)
+        return reportFailure("indices must provide buffer-rank values");
+    } else {
+      if (!resultTensorTy && bufferRank != 0)
+        return reportFailure(
+            "zero-index scalar local_pointers requires rank-0 buffer");
+      if (resultTensorTy && resultTensorTy.getShape() != memDescTy.getShape())
+        return reportFailure(
+            "zero-index tensor local_pointers requires full buffer shape");
+    }
 
     SmallVector<SmallVector<Value>> indexElems;
-    indexElems.reserve(indexVals.size());
-    for (Value indexVal : indexVals) {
-      if (resultTensorTy) {
-        auto elems = unpackLLElements(loc, indexVal, rewriter);
-        if (elems.size() != outVals.size())
-          return reportFailure(
-              "indices tensors must match local_pointers result shape");
-        indexElems.push_back(std::move(elems));
-      } else {
-        Value scalar = ensureI32(indexVal);
-        if (!scalar)
-          return reportFailure("scalar indices must lower to i32 values");
-        indexElems.push_back(SmallVector<Value>{scalar});
+    if (hasExplicitIndices) {
+      indexElems.reserve(indexVals.size());
+      for (Value indexVal : indexVals) {
+        if (resultTensorTy) {
+          auto elems = unpackLLElements(loc, indexVal, rewriter);
+          if (elems.size() != outVals.size())
+            return reportFailure(
+                "indices tensors must match local_pointers result shape");
+          indexElems.push_back(std::move(elems));
+        } else {
+          Value scalar = ensureI32(indexVal);
+          if (!scalar)
+            return reportFailure("scalar indices must lower to i32 values");
+          indexElems.push_back(SmallVector<Value>{scalar});
+        }
+      }
+    } else if (resultTensorTy) {
+      auto fullCoords = emitIndices(loc, rewriter, targetInfo,
+                                    resultTensorTy.getEncoding(),
+                                    resultTensorTy,
+                                    /*withCTAOffset=*/false);
+      if (fullCoords.size() != outVals.size())
+        return reportFailure(
+            "failed to synthesize full indices for local_pointers");
+      indexElems.assign(bufferRank, SmallVector<Value>{});
+      for (size_t idx = 0; idx < fullCoords.size(); ++idx) {
+        if (fullCoords[idx].size() != bufferRank)
+          return reportFailure("synthesized full indices rank mismatch");
+        for (size_t dim = 0; dim < bufferRank; ++dim) {
+          Value coord = ensureI32(fullCoords[idx][dim]);
+          if (!coord)
+            return reportFailure(
+                "synthesized full indices must lower to i32 values");
+          indexElems[dim].push_back(coord);
+        }
       }
     }
 
     for (size_t idx = 0; idx < outVals.size(); ++idx) {
       SmallVector<Value> idxCoords;
-      idxCoords.reserve(indexVals.size());
+      idxCoords.reserve(bufferRank);
       for (size_t dim = 0; dim < indexElems.size(); ++dim) {
         Value val = ensureI32(indexElems[dim][idx]);
         if (!val)
@@ -165,7 +197,10 @@ struct LocalPointersOpConversion
       }
 
       Value elemOffset;
-      if (auto paddedEnc = dyn_cast<ttg::PaddedSharedEncodingAttr>(sharedEnc)) {
+      if (bufferRank == 0) {
+        elemOffset = b.i32_val(0);
+      } else if (auto paddedEnc =
+                     dyn_cast<ttg::PaddedSharedEncodingAttr>(sharedEnc)) {
         auto order = ttg::getOrder(sharedEnc, memDescTy.getShape());
         elemOffset =
             LLVM::linearize(rewriter, loc, idxCoords, bufferShape, order);

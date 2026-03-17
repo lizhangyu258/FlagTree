@@ -43,6 +43,12 @@ except Exception:  # pragma: no cover - optional dependency
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 RADIX_BITS = 8
 RADIX = 1 << RADIX_BITS
+TLE_TOPK_AUTOTUNE_CONFIGS = [
+    triton.Config({}, num_warps=4, num_stages=1),
+    triton.Config({}, num_warps=8, num_stages=1),
+    triton.Config({}, num_warps=16, num_stages=1),
+    triton.Config({}, num_warps=32, num_stages=1),
+]
 
 # %%
 # Key conversions
@@ -173,6 +179,10 @@ def triton_topk_selector_kernel(
 # --------------------------
 
 
+@triton.autotune(
+    configs=TLE_TOPK_AUTOTUNE_CONFIGS,
+    key=["seq_len"],
+)
 @triton.jit
 def tle_topk_selector_kernel(
     x_ptr,
@@ -217,6 +227,12 @@ def tle_topk_selector_kernel(
         scope=tle.gpu.smem,
         nv_mma_shared_layout=False,
     )
+<<<<<<<< HEAD:python/tutorials/tle/05-deepseek_v32_topk_selector.py
+========
+    hist_ptrs = tle.gpu.local_ptr(s_histogram, (bins, ))
+
+    # Ping-pong candidate buffers in shared memory.
+>>>>>>>> e74208c96 (WIP: sync local TLE changes):python/tutorials/tle/deepseek_v32/01-topk_selector.py
     s_num_input = tle.gpu.alloc(
         [2],
         dtype=tl.int32,
@@ -225,13 +241,18 @@ def tle_topk_selector_kernel(
         nv_mma_shared_layout=False,
     )
     s_input_idx = tle.gpu.alloc(
+<<<<<<<< HEAD:python/tutorials/tle/05-deepseek_v32_topk_selector.py
         [2, SMEM_INPUT],
+========
+        [2, SMEM_INPUT_SIZE],
+>>>>>>>> e74208c96 (WIP: sync local TLE changes):python/tutorials/tle/deepseek_v32/01-topk_selector.py
         dtype=tl.int32,
         layout=None,
         scope=tle.gpu.smem,
         nv_mma_shared_layout=False,
     )
 
+<<<<<<<< HEAD:python/tutorials/tle/05-deepseek_v32_topk_selector.py
     hist_idx = tl.arange(0, RADIX)
     hist_last = tl.full([1], RADIX, tl.int32)
 
@@ -270,6 +291,35 @@ def tle_topk_selector_kernel(
 
     num_ptrs = tle.gpu.local_ptr(s_num_input, (tl.zeros([BLOCK_SIZE], tl.int32), ))
     for t in tl.static_range(N_TILES):
+========
+    # Stage 1: coarse 8-bit prescreen on fp16-mapped keys.
+    tl.store(hist_ptrs, tl.zeros([RADIX_SIZE], dtype=tl.int32))
+    tl.store(tle.gpu.local_ptr(s_histogram, (RADIX_SIZE, )), 0)
+    tl.store(tle.gpu.local_ptr(s_num_input, (0, )), 0)
+    tl.store(tle.gpu.local_ptr(s_num_input, (1, )), 0)
+    for t in tl.range(0, n_tiles):
+        offs = t * BLOCK_SIZE + lane
+        in_range = (offs < seq_len) & (offs >= row_start) & (offs < row_end)
+        x = tl.load(row_ptr + offs * stride_xn, mask=in_range, other=float("-inf"))
+        digit8 = _convert_to_uint16_hi8(x)
+        tl.atomic_add(tle.gpu.local_ptr(s_histogram, (digit8, )), ones, mask=in_range, sem="relaxed", scope="cta")
+
+    counts = tl.load(hist_ptrs)
+    cumsum_desc = tl.cumsum(counts, axis=0, reverse=True)
+    tl.store(hist_ptrs, cumsum_desc)
+    tl.store(tle.gpu.local_ptr(s_histogram, (RADIX_SIZE, )), 0)
+
+    # TileLang-style threshold: find bin with cumsum(bin) > k and cumsum(bin+1) <= k.
+    new_topk = tl.full((), TOPK, dtype=tl.int32)
+    cond = cumsum_desc > new_topk
+    threshold_bin = tl.max(tl.where(cond, bins, 0), axis=0).to(tl.int32)
+    counts_gt = tl.load(tle.gpu.local_ptr(s_histogram, (threshold_bin + 1, )))
+    new_topk = new_topk - counts_gt
+
+    # Stage 2: write coarse winners and cache threshold-bin indices into shared memory.
+    num0_ptrs = tle.gpu.local_ptr(s_num_input, (tl.zeros([BLOCK_SIZE], dtype=tl.int32), ))
+    for t in tl.range(0, n_tiles):
+>>>>>>>> e74208c96 (WIP: sync local TLE changes):python/tutorials/tle/deepseek_v32/01-topk_selector.py
         offs = t * BLOCK_SIZE + lane
         in_range = (offs < seq_len) & (offs >= row_start) & (offs < row_end)
         x = tl.load(row_ptr + offs * stride_xn, mask=in_range, other=0.0)
@@ -278,14 +328,30 @@ def tle_topk_selector_kernel(
         gt_thr = bin_i32 > threshold
         eq_thr = bin_i32 == threshold
 
+<<<<<<<< HEAD:python/tutorials/tle/05-deepseek_v32_topk_selector.py
         pos = tl.atomic_add(tle.gpu.local_ptr(s_histogram, (bin_i32 + 1, )), ones, mask=in_range & gt_thr)
         pos = tl.where(in_range & gt_thr, pos, 0)
         tl.store(out_row + pos * stride_outn, offs.to(tl.int32), mask=in_range & gt_thr & (pos < TOPK))
+========
+        take_gt = in_range & (digit8 > threshold_bin)
+        pos_gt = tl.atomic_add(
+            tle.gpu.local_ptr(s_histogram, (digit8 + 1, )),
+            ones,
+            mask=take_gt,
+            sem="relaxed",
+            scope="cta",
+        )
+        tl.store(out_row + pos_gt * stride_outn, offs.to(tl.int32), mask=take_gt & (pos_gt < TOPK))
+>>>>>>>> e74208c96 (WIP: sync local TLE changes):python/tutorials/tle/deepseek_v32/01-topk_selector.py
 
         pos_eq = tl.atomic_add(num_ptrs, ones, mask=in_range & eq_thr & (l_new_topk > 0))
         pos_eq = tl.where(in_range & eq_thr, pos_eq, 0)
         tl.store(
+<<<<<<<< HEAD:python/tutorials/tle/05-deepseek_v32_topk_selector.py
             tle.gpu.local_ptr(s_input_idx, (tl.zeros([BLOCK_SIZE], tl.int32), pos_eq)),
+========
+            tle.gpu.local_ptr(s_input_idx, (tl.zeros([BLOCK_SIZE], dtype=tl.int32), pos_eq)),
+>>>>>>>> e74208c96 (WIP: sync local TLE changes):python/tutorials/tle/deepseek_v32/01-topk_selector.py
             offs.to(tl.int32),
             mask=in_range & eq_thr & (pos_eq < SMEM_INPUT) & (l_new_topk > 0),
         )
@@ -296,6 +362,7 @@ def tle_topk_selector_kernel(
         next_idx = r_idx ^ 1
         start_pos = TOPK - l_new_topk
 
+<<<<<<<< HEAD:python/tutorials/tle/05-deepseek_v32_topk_selector.py
         tl.store(hist_ptrs, 0)
         tl.store(hist_last_ptrs, 0)
         num_ptrs_next = tle.gpu.local_ptr(s_num_input, (tl.full([BLOCK_SIZE], next_idx, tl.int32), ))
@@ -362,6 +429,25 @@ def tle_topk_selector_kernel(
             if round_id == 3:
                 pos_eq = tl.atomic_add(
                     tle.gpu.local_ptr(s_histogram, (bin_i32 + 1, )),
+========
+            tl.store(hist_ptrs, tl.zeros([RADIX_SIZE], dtype=tl.int32))
+            tl.store(tle.gpu.local_ptr(s_histogram, (RADIX_SIZE, )), 0)
+            tl.store(tle.gpu.local_ptr(s_num_input, (nxt_buf, )), 0)
+
+            num_in = tl.load(tle.gpu.local_ptr(s_num_input, (cur_buf, )))
+            num_in_tiles = tl.cdiv(num_in, BLOCK_SIZE)
+
+            # Histogram over current candidate buffer.
+            for t in tl.range(0, num_in_tiles):
+                pos = t * BLOCK_SIZE + lane
+                valid = pos < num_in
+                idx = tl.load(tle.gpu.local_ptr(s_input_idx, (tl.full([BLOCK_SIZE], cur_buf, tl.int32), pos)), mask=valid, other=0)
+                x = tl.load(row_ptr + idx * stride_xn, mask=valid, other=float("-inf"))
+                key = _convert_to_uint32(x)
+                digit = ((key >> shift) & RADIX_MASK).to(tl.int32)
+                tl.atomic_add(
+                    tle.gpu.local_ptr(s_histogram, (digit, )),
+>>>>>>>> e74208c96 (WIP: sync local TLE changes):python/tutorials/tle/deepseek_v32/01-topk_selector.py
                     ones,
                     mask=valid & eq_thr & active & (l_new_topk > 0),
                 )
@@ -382,6 +468,212 @@ def tle_topk_selector_kernel(
                     mask=valid & eq_thr & active & (pos_eq < SMEM_INPUT) & (l_new_topk > 0),
                 )
 
+<<<<<<<< HEAD:python/tutorials/tle/05-deepseek_v32_topk_selector.py
+========
+            counts = tl.load(hist_ptrs)
+            cumsum_desc = tl.cumsum(counts, axis=0, reverse=True)
+            tl.store(hist_ptrs, cumsum_desc)
+            tl.store(tle.gpu.local_ptr(s_histogram, (RADIX_SIZE, )), 0)
+
+            cond = cumsum_desc > new_topk
+            threshold_bin = tl.max(tl.where(cond, bins, 0), axis=0).to(tl.int32)
+            counts_gt = tl.load(tle.gpu.local_ptr(s_histogram, (threshold_bin + 1, )))
+            new_topk = new_topk - counts_gt
+
+            # Partition candidates: winners to output, threshold equals to next buffer.
+            nxt_ptrs = tle.gpu.local_ptr(s_num_input, (tl.full([BLOCK_SIZE], nxt_buf, tl.int32), ))
+            for t in tl.range(0, num_in_tiles):
+                pos = t * BLOCK_SIZE + lane
+                valid = pos < num_in
+                idx = tl.load(tle.gpu.local_ptr(s_input_idx, (tl.full([BLOCK_SIZE], cur_buf, tl.int32), pos)), mask=valid, other=0)
+                x = tl.load(row_ptr + idx * stride_xn, mask=valid, other=float("-inf"))
+                key = _convert_to_uint32(x)
+                digit = ((key >> shift) & RADIX_MASK).to(tl.int32)
+
+                take_gt = valid & (digit > threshold_bin)
+                pos_gt = tl.atomic_add(
+                    tle.gpu.local_ptr(s_histogram, (digit + 1, )),
+                    ones,
+                    mask=take_gt,
+                    sem="relaxed",
+                    scope="cta",
+                )
+                out_pos_gt = pos_gt + start_pos
+                tl.store(out_row + out_pos_gt * stride_outn, idx, mask=take_gt & (out_pos_gt < TOPK))
+
+                take_eq = valid & (digit == threshold_bin) & (new_topk > 0)
+                if round_idx == 3:
+                    pos_eq = tl.atomic_add(
+                        tle.gpu.local_ptr(s_histogram, (digit + 1, )),
+                        ones,
+                        mask=take_eq,
+                        sem="relaxed",
+                        scope="cta",
+                    )
+                    out_pos_eq = pos_eq + start_pos
+                    tl.store(out_row + out_pos_eq * stride_outn, idx, mask=take_eq & (out_pos_eq < TOPK))
+                else:
+                    nxt_pos = tl.atomic_add(nxt_ptrs, ones, mask=take_eq, sem="relaxed", scope="cta")
+                    tl.store(
+                        tle.gpu.local_ptr(s_input_idx, (tl.full([BLOCK_SIZE], nxt_buf, tl.int32), nxt_pos)),
+                        idx,
+                        mask=take_eq & (nxt_pos < SMEM_INPUT_SIZE),
+                    )
+
+
+@triton.jit
+def triton_topk_selector_kernel(
+    x_ptr,
+    out_ptr,
+    cand0_ptr,
+    cand1_ptr,
+    starts_ptr,
+    ends_ptr,
+    stride_xm,
+    stride_xn,
+    stride_outm,
+    stride_outn,
+    stride_c0m,
+    stride_c0n,
+    stride_c1m,
+    stride_c1n,
+    seq_len,
+    ASSUME_ALIGNED: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    RADIX_BITS: tl.constexpr,
+):
+    tl.static_assert(RADIX_BITS == 8, "triton_topk_selector_kernel currently expects 8-bit radix")
+    pid = tl.program_id(0)
+    row_start = tl.load(starts_ptr + pid).to(tl.int32)
+    row_end = tl.load(ends_ptr + pid).to(tl.int32)
+    row_ptr = x_ptr + pid * stride_xm
+    out_row = out_ptr + pid * stride_outm
+    cand0_row = cand0_ptr + pid * stride_c0m
+    cand1_row = cand1_ptr + pid * stride_c1m
+
+    if ASSUME_ALIGNED:
+        tl.assume(row_start == 0)
+        tl.assume(row_end == seq_len)
+        tl.assume(stride_xn == 1)
+        tl.assume(stride_outn == 1)
+        seq_len = tl.multiple_of(seq_len, BLOCK_SIZE)
+
+    lane = tl.arange(0, BLOCK_SIZE)
+    n_tiles = tl.cdiv(seq_len, BLOCK_SIZE)
+    RADIX_SIZE: tl.constexpr = 1 << RADIX_BITS
+    RADIX_MASK: tl.constexpr = RADIX_SIZE - 1
+    bins = tl.arange(0, RADIX_SIZE)
+
+    # Stage 1: 8-bit coarse prescreen on fp16-mapped keys.
+    coarse_counts = tl.zeros([RADIX_SIZE], dtype=tl.int32)
+    for t in tl.range(0, n_tiles):
+        offs = t * BLOCK_SIZE + lane
+        in_range = (offs < seq_len) & (offs >= row_start) & (offs < row_end)
+        x = tl.load(row_ptr + offs * stride_xn, mask=in_range, other=float("-inf"))
+        digit8 = _convert_to_uint16_hi8(x)
+        coarse_counts = coarse_counts + tl.histogram(digit8, RADIX_SIZE, mask=in_range)
+
+    coarse_cumsum_desc = tl.cumsum(coarse_counts, axis=0, reverse=True)
+    topk_target = tl.full((), TOPK, tl.int32)
+    coarse_cond = coarse_cumsum_desc > topk_target
+    coarse_threshold_bin = tl.max(tl.where(coarse_cond, bins, 0), axis=0).to(tl.int32)
+    coarse_counts_gt = tl.max(tl.where(bins == (coarse_threshold_bin + 1), coarse_cumsum_desc, 0), axis=0)
+    new_topk = topk_target - coarse_counts_gt
+    write_count = tl.full((), 0, tl.int32)
+    cand_count0 = tl.full((), 0, tl.int32)
+
+    # Stage 2: write coarse winners and compact coarse-threshold candidates into cand0.
+    for t in tl.range(0, n_tiles):
+        offs = t * BLOCK_SIZE + lane
+        in_range = (offs < seq_len) & (offs >= row_start) & (offs < row_end)
+        x = tl.load(row_ptr + offs * stride_xn, mask=in_range, other=float("-inf"))
+        digit8 = _convert_to_uint16_hi8(x)
+        take = in_range & (digit8 > coarse_threshold_bin)
+        take_i32 = take.to(tl.int32)
+        pos = write_count + tl.cumsum(take_i32, axis=0) - 1
+        mask = take & (pos < TOPK)
+        tl.store(out_row + pos * stride_outn, offs.to(tl.int32), mask=mask)
+        write_count = write_count + tl.sum(take_i32, axis=0)
+
+        take_eq = in_range & (digit8 == coarse_threshold_bin)
+        take_eq_i32 = take_eq.to(tl.int32)
+        pos_eq = cand_count0 + tl.cumsum(take_eq_i32, axis=0) - 1
+        tl.store(cand0_row + pos_eq * stride_c0n, offs.to(tl.int32), mask=take_eq)
+        cand_count0 = cand_count0 + tl.sum(take_eq_i32, axis=0)
+
+    # Stage 3: four 8-bit refinements over compact candidate lists.
+    num_in = cand_count0
+    for round_idx in tl.static_range(4):
+        if (new_topk > 0) & (num_in > 0):
+            shift: tl.constexpr = 24 - round_idx * 8
+            desired = tl.full((), 0, tl.uint32)
+            desired_mask = tl.full((), 0, tl.uint32)
+            k_to_find = new_topk
+            num_in_tiles = tl.cdiv(num_in, BLOCK_SIZE)
+            counts = tl.zeros([RADIX_SIZE], dtype=tl.int32)
+
+            # Histogram on current candidate table.
+            for t in tl.range(0, num_in_tiles):
+                pos = t * BLOCK_SIZE + lane
+                valid = pos < num_in
+                if round_idx & 1:
+                    idx = tl.load(cand1_row + pos * stride_c1n, mask=valid, other=0)
+                else:
+                    idx = tl.load(cand0_row + pos * stride_c0n, mask=valid, other=0)
+                x = tl.load(row_ptr + idx * stride_xn, mask=valid, other=float("-inf"))
+                x_key = _convert_to_uint32(x)
+                matches = (x_key & desired_mask) == desired
+                take = valid & matches
+                digit = ((x_key >> shift) & RADIX_MASK).to(tl.int32)
+                counts = counts + tl.histogram(digit, RADIX_SIZE, mask=take)
+
+            cumsum_desc = tl.cumsum(counts, axis=0, reverse=True)
+            cond = cumsum_desc > k_to_find
+            threshold_bin = tl.max(tl.where(cond, bins, 0), axis=0).to(tl.int32)
+            counts_gt = tl.max(tl.where(bins == (threshold_bin + 1), cumsum_desc, 0), axis=0)
+            desired = desired | (threshold_bin.to(tl.uint32) << shift)
+            desired_mask = desired_mask | (tl.full((), RADIX_MASK, tl.uint32) << shift)
+            new_topk = k_to_find - counts_gt
+
+            out_count = write_count
+            next_count = tl.full((), 0, tl.int32)
+            for t in tl.range(0, num_in_tiles):
+                pos = t * BLOCK_SIZE + lane
+                valid = pos < num_in
+                if round_idx & 1:
+                    idx = tl.load(cand1_row + pos * stride_c1n, mask=valid, other=0)
+                else:
+                    idx = tl.load(cand0_row + pos * stride_c0n, mask=valid, other=0)
+                x = tl.load(row_ptr + idx * stride_xn, mask=valid, other=float("-inf"))
+                x_key = _convert_to_uint32(x)
+                digit = ((x_key >> shift) & RADIX_MASK).to(tl.int32)
+
+                take_gt = valid & (digit > threshold_bin)
+                take_gt_i32 = take_gt.to(tl.int32)
+                out_pos_gt = out_count + tl.cumsum(take_gt_i32, axis=0) - 1
+                out_mask_gt = take_gt & (out_pos_gt < TOPK)
+                tl.store(out_row + out_pos_gt * stride_outn, idx, mask=out_mask_gt)
+                out_count = out_count + tl.sum(take_gt_i32, axis=0)
+
+                take_eq = valid & (digit == threshold_bin)
+                take_eq_i32 = take_eq.to(tl.int32)
+                if round_idx == 3:
+                    out_pos_eq = out_count + tl.cumsum(take_eq_i32, axis=0) - 1
+                    out_mask_eq = take_eq & (out_pos_eq < TOPK)
+                    tl.store(out_row + out_pos_eq * stride_outn, idx, mask=out_mask_eq)
+                    out_count = out_count + tl.sum(take_eq_i32, axis=0)
+                else:
+                    nxt_pos = next_count + tl.cumsum(take_eq_i32, axis=0) - 1
+                    if round_idx & 1:
+                        tl.store(cand0_row + nxt_pos * stride_c0n, idx, mask=take_eq)
+                    else:
+                        tl.store(cand1_row + nxt_pos * stride_c1n, idx, mask=take_eq)
+                    next_count = next_count + tl.sum(take_eq_i32, axis=0)
+
+            write_count = out_count
+            num_in = next_count
+>>>>>>>> e74208c96 (WIP: sync local TLE changes):python/tutorials/tle/deepseek_v32/01-topk_selector.py
 
 # %%
 # TileLang reference (optional)
@@ -633,8 +925,11 @@ def tle_topk_selector(
     ends,
     topk,
     block_size=1024,
+<<<<<<<< HEAD:python/tutorials/tle/05-deepseek_v32_topk_selector.py
     num_warps=32,
     smem_input=4096,
+========
+>>>>>>>> e74208c96 (WIP: sync local TLE changes):python/tutorials/tle/deepseek_v32/01-topk_selector.py
     out: Optional[torch.Tensor] = None,
     assume_aligned: Optional[bool] = None,
 ):
@@ -651,6 +946,7 @@ def tle_topk_selector(
         assume_aligned = (x.is_contiguous() and out.is_contiguous() and (seq_len % block_size == 0)
                           and torch.all(starts == 0).item() and torch.all(ends == seq_len).item())
 
+    batch, seq_len = x.shape
     grid = (batch, )
     tle_topk_selector_kernel[grid](
         x,
@@ -667,14 +963,84 @@ def tle_topk_selector(
         ASSUME_ALIGNED=assume_aligned,
         TOPK=topk,
         BLOCK_SIZE=block_size,
+<<<<<<<< HEAD:python/tutorials/tle/05-deepseek_v32_topk_selector.py
         N_TILES=n_tiles,
         SMEM_INPUT=smem_input,
         NUM_INPUT_TILES=num_input_tiles,
         num_warps=num_warps,
+========
+        SMEM_INPUT_SIZE=4096,
+>>>>>>>> e74208c96 (WIP: sync local TLE changes):python/tutorials/tle/deepseek_v32/01-topk_selector.py
     )
     return out
 
 
+<<<<<<<< HEAD:python/tutorials/tle/05-deepseek_v32_topk_selector.py
+========
+def triton_topk_selector(
+    x,
+    starts,
+    ends,
+    topk,
+    block_size=1024,
+    out: Optional[torch.Tensor] = None,
+    cand0: Optional[torch.Tensor] = None,
+    cand1: Optional[torch.Tensor] = None,
+    assume_aligned: Optional[bool] = None,
+):
+    if x.dtype != torch.float32:
+        x = x.float()
+    batch, seq_len = x.shape
+    if out is None:
+        out = torch.full((batch, topk), -1, dtype=torch.int32, device=x.device)
+    if cand0 is None:
+        cand0 = torch.empty((batch, seq_len), dtype=torch.int32, device=x.device)
+    if cand1 is None:
+        cand1 = torch.empty((batch, seq_len), dtype=torch.int32, device=x.device)
+
+    if assume_aligned is None:
+        assume_aligned = (
+            x.is_contiguous()
+            and out.is_contiguous()
+            and (seq_len % block_size == 0)
+            and torch.all(starts == 0).item()
+            and torch.all(ends == seq_len).item()
+        )
+
+    assert cand0.shape == (batch, seq_len) and cand0.dtype == torch.int32 and cand0.is_cuda
+    assert cand1.shape == (batch, seq_len) and cand1.dtype == torch.int32 and cand1.is_cuda
+
+    # Triton kernel uses kernel-specific tuning to avoid slow/unstable configs.
+    kernel_num_warps = 4 if block_size >= 1024 else 8
+
+    grid = (batch, )
+    triton_topk_selector_kernel[grid](
+        x,
+        out,
+        cand0,
+        cand1,
+        starts,
+        ends,
+        x.stride(0),
+        x.stride(1),
+        out.stride(0),
+        out.stride(1),
+        cand0.stride(0),
+        cand0.stride(1),
+        cand1.stride(0),
+        cand1.stride(1),
+        seq_len,
+        ASSUME_ALIGNED=assume_aligned,
+        TOPK=topk,
+        BLOCK_SIZE=block_size,
+        RADIX_BITS=8,
+        num_warps=kernel_num_warps,
+        num_stages=1,
+    )
+    return out
+
+
+>>>>>>>> e74208c96 (WIP: sync local TLE changes):python/tutorials/tle/deepseek_v32/01-topk_selector.py
 # %%
 # Correctness & benchmarking
 # --------------------------
@@ -724,11 +1090,17 @@ _BENCH_STYLES = [("red", "-"), ("orange", "-"), ("green", "-")] + ([("blue", "-"
         ylabel="ms",
         plot_name="tle-deepseek-v32-topk-selector",
         args={},
+<<<<<<<< HEAD:python/tutorials/tle/05-deepseek_v32_topk_selector.py
     ))
 def benchmark(batch, seq_len, topk, provider, block_size, smem_input, num_warps, warmup, rep):
     if topk > smem_input:
         return float("nan"), float("nan"), float("nan")
 
+========
+    )
+)
+def benchmark(batch, seq_len, topk, provider, block_size, warmup, rep):
+>>>>>>>> e74208c96 (WIP: sync local TLE changes):python/tutorials/tle/deepseek_v32/01-topk_selector.py
     torch.manual_seed(1)
     x = torch.randn(batch, seq_len, device=DEVICE, dtype=torch.float32)
     starts = torch.zeros(batch, dtype=torch.int32, device=DEVICE)
@@ -764,12 +1136,36 @@ def benchmark(batch, seq_len, topk, provider, block_size, smem_input, num_warps,
                 ends,
                 topk,
                 block_size=block_size,
+<<<<<<<< HEAD:python/tutorials/tle/05-deepseek_v32_topk_selector.py
                 num_warps=num_warps,
                 smem_input=smem_input,
+========
+>>>>>>>> e74208c96 (WIP: sync local TLE changes):python/tutorials/tle/deepseek_v32/01-topk_selector.py
                 out=tle_out,
                 assume_aligned=assume_aligned,
             )
 
+<<<<<<<< HEAD:python/tutorials/tle/05-deepseek_v32_topk_selector.py
+========
+    elif provider == "triton":
+        triton_out = torch.full((batch, topk), -1, dtype=torch.int32, device=x.device)
+        triton_cand0 = torch.empty((batch, seq_len), dtype=torch.int32, device=x.device)
+        triton_cand1 = torch.empty((batch, seq_len), dtype=torch.int32, device=x.device)
+
+        def run():
+            triton_topk_selector(
+                x,
+                starts,
+                ends,
+                topk,
+                block_size=block_size,
+                out=triton_out,
+                cand0=triton_cand0,
+                cand1=triton_cand1,
+                assume_aligned=assume_aligned,
+            )
+
+>>>>>>>> e74208c96 (WIP: sync local TLE changes):python/tutorials/tle/deepseek_v32/01-topk_selector.py
     elif provider == "torch":
 
         def run():
@@ -792,7 +1188,11 @@ def benchmark(batch, seq_len, topk, provider, block_size, smem_input, num_warps,
     return ms, max_ms, min_ms
 
 
+<<<<<<<< HEAD:python/tutorials/tle/05-deepseek_v32_topk_selector.py
 def run_correctness(batch, seq_len, topk, block_size, smem_input, num_warps):
+========
+def run_correctness(batch, seq_len, topk, block_size):
+>>>>>>>> e74208c96 (WIP: sync local TLE changes):python/tutorials/tle/deepseek_v32/01-topk_selector.py
     torch.manual_seed(1)
     x = torch.randn(batch, seq_len, device=DEVICE, dtype=torch.float32)
     starts = torch.zeros(batch, dtype=torch.int32, device=DEVICE)
@@ -801,14 +1201,30 @@ def run_correctness(batch, seq_len, topk, block_size, smem_input, num_warps):
 
     ref = _torch_topk_indices(x, starts, ends, topk)
 
+<<<<<<<< HEAD:python/tutorials/tle/05-deepseek_v32_topk_selector.py
+========
+    tle_out = tle_topk_selector(
+        x,
+        starts,
+        ends,
+        topk,
+        block_size=block_size,
+        assume_aligned=assume_aligned,
+    )
+
+    print(f"TLE recall vs torch.topk: {_recall(tle_out, ref):.4f}")
+>>>>>>>> e74208c96 (WIP: sync local TLE changes):python/tutorials/tle/deepseek_v32/01-topk_selector.py
     triton_out = triton_topk_selector(
         x,
         starts,
         ends,
         topk,
         block_size=block_size,
+<<<<<<<< HEAD:python/tutorials/tle/05-deepseek_v32_topk_selector.py
         num_warps=num_warps,
         smem_input=smem_input,
+========
+>>>>>>>> e74208c96 (WIP: sync local TLE changes):python/tutorials/tle/deepseek_v32/01-topk_selector.py
         assume_aligned=assume_aligned,
     )
     tle_out = tle_topk_selector(
@@ -834,13 +1250,20 @@ def run_correctness(batch, seq_len, topk, block_size, smem_input, num_warps):
         print("TileLang not available; skipping TileLang correctness.")
 
 
+<<<<<<<< HEAD:python/tutorials/tle/05-deepseek_v32_topk_selector.py
 def run_bench(block_size, smem_input, num_warps, warmup, rep, show_plots):
+========
+def run_bench(block_size, warmup, rep, show_plots):
+>>>>>>>> e74208c96 (WIP: sync local TLE changes):python/tutorials/tle/deepseek_v32/01-topk_selector.py
     benchmark.run(
         print_data=True,
         show_plots=show_plots,
         block_size=block_size,
+<<<<<<<< HEAD:python/tutorials/tle/05-deepseek_v32_topk_selector.py
         smem_input=smem_input,
         num_warps=num_warps,
+========
+>>>>>>>> e74208c96 (WIP: sync local TLE changes):python/tutorials/tle/deepseek_v32/01-topk_selector.py
         warmup=warmup,
         rep=rep,
     )
@@ -857,8 +1280,11 @@ def main(argv=None):
     parser.add_argument("--seq_len", type=int, default=4096, help="sequence length")
     parser.add_argument("--topk", type=int, default=128, help="top-k")
     parser.add_argument("--block_size", type=int, default=1024, help="block size (threads)")
+<<<<<<<< HEAD:python/tutorials/tle/05-deepseek_v32_topk_selector.py
     parser.add_argument("--smem_input", type=int, default=4096, help="candidate buffer size")
     parser.add_argument("--num_warps", type=int, default=32, help="num warps")
+========
+>>>>>>>> e74208c96 (WIP: sync local TLE changes):python/tutorials/tle/deepseek_v32/01-topk_selector.py
     parser.add_argument("--warmup", type=int, default=5, help="warmup iters")
     parser.add_argument("--rep", type=int, default=20, help="benchmark iters")
     parser.add_argument("--show_plots", action="store_true", help="show plots in benchmark")
@@ -875,15 +1301,21 @@ def main(argv=None):
             seq_len=args.seq_len,
             topk=args.topk,
             block_size=args.block_size,
+<<<<<<<< HEAD:python/tutorials/tle/05-deepseek_v32_topk_selector.py
             smem_input=args.smem_input,
             num_warps=args.num_warps,
+========
+>>>>>>>> e74208c96 (WIP: sync local TLE changes):python/tutorials/tle/deepseek_v32/01-topk_selector.py
         )
 
     if not args.skip_bench:
         run_bench(
             block_size=args.block_size,
+<<<<<<<< HEAD:python/tutorials/tle/05-deepseek_v32_topk_selector.py
             smem_input=args.smem_input,
             num_warps=args.num_warps,
+========
+>>>>>>>> e74208c96 (WIP: sync local TLE changes):python/tutorials/tle/deepseek_v32/01-topk_selector.py
             warmup=args.warmup,
             rep=args.rep,
             show_plots=args.show_plots,

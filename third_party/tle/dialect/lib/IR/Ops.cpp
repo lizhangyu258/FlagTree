@@ -86,6 +86,21 @@ LogicalResult LocalPointersOp::verify() {
     return emitOpError() << "expects pointers to live in shared memory";
 
   auto indices = getIndices();
+  if (indices.empty()) {
+    if (resultTensorTy) {
+      if (resultTensorTy.getShape() != memDescTy.getShape())
+        return emitOpError()
+               << "zero-index local_pointers expects tensor result shape to "
+                  "match buffer shape";
+      return success();
+    }
+    if (!memDescTy.getShape().empty())
+      return emitOpError()
+             << "zero-index scalar local_pointers is only valid for rank-0 "
+                "buffers";
+    return success();
+  }
+
   if (indices.size() != memDescTy.getShape().size())
     return emitOpError() << "expects indices count to match buffer rank";
 

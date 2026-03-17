@@ -228,10 +228,17 @@ void init_triton_tle_ir(py::module &&m) {
 void init_triton_tle_passes(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_early_assign_memory_space",
                      tle::createTritonTleEarlyAssignMemorySpace);
+  ADD_PASS_WRAPPER_0("add_select_encodings",
+                     tle::createTritonTleSelectEncodings);
+  // Backward-compatible alias.
   ADD_PASS_WRAPPER_0("add_assign_local_pointers_encoding",
-                     tle::createTritonTleAssignLocalPointersEncoding);
+                     tle::createTritonTleSelectEncodings);
   ADD_PASS_WRAPPER_0("add_insert_local_pointer_barriers",
                      tle::createTritonTleInsertLocalPointerBarriers);
+  ADD_PASS_WRAPPER_0("add_optimize_local_pointer_loads",
+                     tle::createTritonTleOptimizeLocalPointerLoads);
+  ADD_PASS_WRAPPER_0("add_optimize_local_pointer_stores",
+                     tle::createTritonTleOptimizeLocalPointerStores);
   ADD_PASS_WRAPPER_0("add_lower_async_load",
                      tle::createTritonTleLowerAsyncLoad);
   ADD_PASS_WRAPPER_0("add_lower_tma_copy", tle::createTritonTleLowerTmaCopy);

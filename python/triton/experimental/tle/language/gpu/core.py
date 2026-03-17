@@ -387,9 +387,10 @@ def local_ptr(
 
     Args:
         buffer: Local memory buffer tensor returned by ``tle.alloc``.
-        indices: Tuple of integer index tensors. The tuple length must equal
-            the rank of ``buffer`` and every tensor must have the same shape.
-            The output pointer tensor will have that same shape.
+        indices: Optional tuple of integer index tensors. If provided, tuple
+            length must equal ``rank(buffer)`` and every tensor must have the
+            same shape. If ``None``, emit a full-view pointer tensor over
+            ``buffer`` shape (or scalar pointer for rank-0 buffer).
         _semantic: Semantic analyzer (internal use).
         _generator: Triton code generator (internal use).
 
@@ -408,46 +409,51 @@ def local_ptr(
         remote_scope = getattr(buffer, "_tle_remote_scope", None)
     remote_buffer_marker = remote_shard_id is not None
 
+    buffer_shape = tuple(int(tl._unwrap_if_constexpr(dim)) for dim in buffer.type.shape)
     indices = tl._unwrap_if_constexpr(indices)
-    if indices is None:
-        raise ValueError("local_ptr indices must be provided as a tuple of tensors")
-    if isinstance(indices, tl.tuple):
+    no_indices = indices is None
+    if no_indices:
+        indices_tuple = tuple()
+    elif isinstance(indices, tl.tuple):
         indices_tuple = tuple(indices.values)
     elif isinstance(indices, (tuple, list)):
         indices_tuple = tuple(indices)
     else:
-        raise ValueError("local_ptr indices must be a tuple or list of tensors")
-
-    buffer_shape = tuple(int(tl._unwrap_if_constexpr(dim)) for dim in buffer.type.shape)
-    if len(indices_tuple) != len(buffer_shape):
+        raise ValueError("local_ptr indices must be a tuple/list of tensors or None")
+    if not no_indices and len(indices_tuple) != len(buffer_shape):
         raise ValueError(f"local_ptr indices must provide {len(buffer_shape)} tensors, got {len(indices_tuple)}")
 
     idx_tensors: list[tensor] = []
     view_shape: Optional[tuple[int, ...]] = None
     scalar_index_flags: list[bool] = []
-    for idx in indices_tuple:
-        idx_tensor = idx if isinstance(idx, tensor) else _semantic.to_tensor(idx)
-        if not idx_tensor.dtype.is_int():
-            raise ValueError("local_ptr indices must use integer dtypes")
-        is_scalar_index = not idx_tensor.type.is_block()
-        scalar_index_flags.append(is_scalar_index)
-        if is_scalar_index:
+    if not no_indices:
+        for idx in indices_tuple:
+            idx_tensor = idx if isinstance(idx, tensor) else _semantic.to_tensor(idx)
+            if not idx_tensor.dtype.is_int():
+                raise ValueError("local_ptr indices must use integer dtypes")
+            is_scalar_index = not idx_tensor.type.is_block()
+            scalar_index_flags.append(is_scalar_index)
+            if is_scalar_index:
+                idx_tensors.append(idx_tensor)
+                continue
+            if view_shape is None:
+                view_shape = tuple(idx_tensor.shape)
+            elif tuple(idx_tensor.shape) != view_shape:
+                raise ValueError("local_ptr indices must have identical shapes")
             idx_tensors.append(idx_tensor)
-            continue
-        if view_shape is None:
-            view_shape = tuple(idx_tensor.shape)
-        elif tuple(idx_tensor.shape) != view_shape:
-            raise ValueError("local_ptr indices must have identical shapes")
-        idx_tensors.append(idx_tensor)
 
-    if not idx_tensors:
-        raise ValueError("local_ptr indices cannot be empty")
-    all_scalar_indices = all(scalar_index_flags)
-    any_scalar_indices = any(scalar_index_flags)
-    if any_scalar_indices and not all_scalar_indices:
-        raise ValueError("local_ptr indices must be either all scalar or all tensors with identical shapes")
-    if not all_scalar_indices and view_shape is None:
-        view_shape = tuple()
+        if not idx_tensors:
+            raise ValueError("local_ptr indices cannot be empty")
+        all_scalar_indices = all(scalar_index_flags)
+        any_scalar_indices = any(scalar_index_flags)
+        if any_scalar_indices and not all_scalar_indices:
+            raise ValueError("local_ptr indices must be either all scalar or all tensors with identical shapes")
+        if not all_scalar_indices and view_shape is None:
+            view_shape = tuple()
+    else:
+        all_scalar_indices = len(buffer_shape) == 0
+        if not all_scalar_indices:
+            view_shape = buffer_shape
 
     try:
         from .semantic import TLESemantic
@@ -461,7 +467,14 @@ def local_ptr(
     insert_block = _semantic.builder.get_insertion_block()
     if insert_block is None:
         raise RuntimeError("TLE local_ptr called without an insertion block")
-    if all_scalar_indices:
+    if no_indices:
+        if len(buffer_shape) == 0:
+            result_ty = ptr_dtype
+            result_ir = ptr_dtype.to_ir(_semantic.builder)
+        else:
+            result_ty = tl.block_type(ptr_dtype, list(buffer_shape))
+            result_ir = result_ty.to_ir(_semantic.builder)
+    elif all_scalar_indices:
         result_ty = ptr_dtype
         result_ir = ptr_dtype.to_ir(_semantic.builder)
     else:

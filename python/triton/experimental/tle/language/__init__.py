@@ -20,7 +20,6 @@ from .distributed import (
     shard_id,
     sharding,
 )
-from . import distributed, gpu, raw
 
 __all__ = [
     "load",
@@ -41,3 +40,5 @@ __all__ = [
     "gpu",
     "raw",
 ]
+
+from . import distributed, gpu, raw
