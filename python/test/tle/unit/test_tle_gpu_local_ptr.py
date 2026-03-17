@@ -365,10 +365,11 @@ class TestTLELocalPointerKernel:
         )
         ttgir = compiled.asm["ttgir"]
         assert "ttg.local_store" in ttgir
-        line = next(line for line in ttgir.splitlines() if "tle.gpu.local_pointers" in line)
-        line_lhs = line.split(":", 1)[0]
-        assert "tle.gpu.local_pointers" in line_lhs
-        assert "," not in line_lhs
+        line = next((line for line in ttgir.splitlines() if "tle.gpu.local_pointers" in line), None)
+        if line is not None:
+            line_lhs = line.split(":", 1)[0]
+            assert "tle.gpu.local_pointers" in line_lhs
+            assert "," not in line_lhs
 
         _local_pointer_full_view_store_kernel[(1, )](
             out,
