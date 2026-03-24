@@ -117,8 +117,6 @@ def processHistogramStep(
     s_threshold_bin_idx_ptr,
     s_final_bin_size_ptr,
     ASSUME_ALIGNED: tl.constexpr,
-    USE_TLE_CUMSUM: tl.constexpr,
-    FORCE_DISABLE_FINAL: tl.constexpr,
     TOPK: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -271,12 +269,7 @@ def processHistogramStep(
             if not threshold_found:
                 bins = round_idx * BLOCK_SIZE + lane
                 counts = tl.load(hist_base_ptr + bins)
-                if USE_TLE_CUMSUM:
-                    prefix_sum, counts_total = tle.cumsum(counts, axis=0, reverse=False)
-                else:
-                    inclusive_sum = tl.cumsum(counts, axis=0, reverse=False)
-                    prefix_sum = inclusive_sum - counts
-                    counts_total = tl.max(inclusive_sum, axis=0).to(tl.int32)
+                prefix_sum, counts_total = tle.cumsum(counts, axis=0, reverse=False)
                 prefix_sum = prefix_sum + last_value
                 total_sum = last_value + counts_total
                 next_prefix_sum = prefix_sum + counts
@@ -293,10 +286,7 @@ def processHistogramStep(
         final_bin_size = tl.load(s_final_bin_size_ptr)
         tl.store(s_step_thresholds_ptr + step_idx, threshold_bin_idx)
 
-    if FORCE_DISABLE_FINAL:
-        use_final = tl.full((), False, dtype=tl.int1)
-    else:
-        use_final = (step_idx < 3) & (threshold_bin_idx >= 0) & (final_bin_size <= FINAL_SORT_ITEMS)
+    use_final = (step_idx < 3) & (threshold_bin_idx >= 0) & (final_bin_size <= FINAL_SORT_ITEMS)
     if use_final:
         tl.store(s_final_cnt_ptr, 0)
 
@@ -564,8 +554,6 @@ def tle_topk_selector_kernel(
     stride_outn,
     seq_len,
     ASSUME_ALIGNED: tl.constexpr,
-    USE_TLE_CUMSUM: tl.constexpr,
-    FORCE_DISABLE_FINAL: tl.constexpr,
     TOPK: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -690,8 +678,6 @@ def tle_topk_selector_kernel(
                 s_threshold_bin_idx_ptr,
                 s_final_bin_size_ptr,
                 ASSUME_ALIGNED=ASSUME_ALIGNED,
-                USE_TLE_CUMSUM=USE_TLE_CUMSUM,
-                FORCE_DISABLE_FINAL=FORCE_DISABLE_FINAL,
                 TOPK=TOPK,
                 BLOCK_SIZE=BLOCK_SIZE,
             )
@@ -745,10 +731,11 @@ def processHistogramStep_compact(
     row_end,
     seq_len,
     step_idx,
-    cand_in_ptr,
-    cand_in_count,
-    cand_out_ptr,
-    s_cand_out_count_ptr,
+    logit_pattern,
+    cand_idx_ptr,
+    cand_val_bits_ptr,
+    cand_count,
+    s_cand_count_ptr,
     found_topk_values,
     hist_base_ptr,
     s_out_indices_ptr,
@@ -756,8 +743,6 @@ def processHistogramStep_compact(
     s_found_topk_values_ptr,
     s_threshold_bin_idx_ptr,
     s_final_bin_size_ptr,
-    USE_TLE_CUMSUM: tl.constexpr,
-    FORCE_DISABLE_FINAL: tl.constexpr,
     ASSUME_ALIGNED: tl.constexpr,
     TOPK: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -784,8 +769,8 @@ def processHistogramStep_compact(
         tl.store(hist_base_ptr + bins, 0, mask=bins < radix_size)
     tl.debug_barrier()
 
-    num_in_tiles = tl.cdiv(cand_in_count, BLOCK_SIZE)
-    # step0 scans the full row; step1~3 scan compact candidates from smem.
+    # step0 scans full row and materializes threshold-equal candidates in smem.
+    # step1~3 scan that compact smem candidate set.
     if step_idx == 0:
         if ASSUME_ALIGNED:
             n_vec_full = seq_len // (BLOCK_SIZE * VEC)
@@ -829,11 +814,12 @@ def processHistogramStep_compact(
                         scope="cta",
                     )
     else:
-        for t in tl.range(0, num_in_tiles):
-            pos = t * BLOCK_SIZE + lane
-            valid = pos < cand_in_count
-            idx = tl.load(cand_in_ptr + pos, mask=valid, other=0)
-            x = tl.load(row_ptr + idx * stride_xn, mask=valid, other=float("-inf"))
+        full_vec_elems = BLOCK_SIZE * VEC
+        num_in_full_vec_tiles = cand_count // full_vec_elems
+        for t in tl.range(0, num_in_full_vec_tiles):
+            pos = t * BLOCK_SIZE * VEC + lane[:, None] * VEC + vec[None, :]
+            x_bits = tl.load(cand_val_bits_ptr + pos)
+            x = x_bits.to(tl.float32, bitcast=True)
             key = _convert_to_trt_uint32(x)
             if step_idx == 1:
                 digit = ((key >> 21) & RADIX11_MASK).to(tl.int32)
@@ -842,11 +828,49 @@ def processHistogramStep_compact(
             else:
                 digit = (key & RADIX10_MASK).to(tl.int32)
 
+            if step_idx == 1:
+                partial = tl.full([BLOCK_SIZE, VEC], True, tl.int1)
+            elif step_idx == 2:
+                partial = ((key ^ logit_pattern) >> 21) == 0
+            else:
+                partial = ((key ^ logit_pattern) >> 10) == 0
+
             if True:
                 tl.atomic_add(
                     hist_base_ptr + digit,
-                    ones,
-                    mask=valid,
+                    ones_vec_2d,
+                    mask=partial,
+                    sem="relaxed",
+                    scope="cta",
+                )
+
+        rem = cand_count - num_in_full_vec_tiles * full_vec_elems
+        if rem > 0:
+            t = num_in_full_vec_tiles
+            pos = t * BLOCK_SIZE * VEC + lane[:, None] * VEC + vec[None, :]
+            valid = pos < cand_count
+            x_bits = tl.load(cand_val_bits_ptr + pos, mask=valid, other=0)
+            x = x_bits.to(tl.float32, bitcast=True)
+            key = _convert_to_trt_uint32(x)
+            if step_idx == 1:
+                digit = ((key >> 21) & RADIX11_MASK).to(tl.int32)
+            elif step_idx == 2:
+                digit = ((key >> 10) & RADIX11_MASK).to(tl.int32)
+            else:
+                digit = (key & RADIX10_MASK).to(tl.int32)
+
+            if step_idx == 1:
+                partial = valid
+            elif step_idx == 2:
+                partial = valid & (((key ^ logit_pattern) >> 21) == 0)
+            else:
+                partial = valid & (((key ^ logit_pattern) >> 10) == 0)
+
+            if True:
+                tl.atomic_add(
+                    hist_base_ptr + digit,
+                    ones_vec_2d,
+                    mask=partial,
                     sem="relaxed",
                     scope="cta",
                 )
@@ -875,12 +899,7 @@ def processHistogramStep_compact(
                 bins = round_idx * BLOCK_SIZE + lane
                 active = bins < radix_size
                 counts = tl.load(hist_base_ptr + bins, mask=active, other=0)
-                if USE_TLE_CUMSUM:
-                    prefix_sum, counts_total = tle.cumsum(counts, axis=0, reverse=False)
-                else:
-                    inclusive_sum = tl.cumsum(counts, axis=0, reverse=False)
-                    prefix_sum = inclusive_sum - counts
-                    counts_total = tl.max(inclusive_sum, axis=0).to(tl.int32)
+                prefix_sum, counts_total = tle.cumsum(counts, axis=0, reverse=False)
                 prefix_sum = prefix_sum + last_value
                 total_sum = last_value + counts_total
                 next_prefix_sum = prefix_sum + counts
@@ -896,14 +915,11 @@ def processHistogramStep_compact(
         threshold_bin_idx = tl.load(s_threshold_bin_idx_ptr)
         final_bin_size = tl.load(s_final_bin_size_ptr)
 
-    if FORCE_DISABLE_FINAL:
-        use_final = tl.full((), False, dtype=tl.int1)
-    else:
-        use_final = (step_idx < 3) & (threshold_bin_idx >= 0) & (final_bin_size <= FINAL_SORT_ITEMS)
+    use_final = (step_idx < 3) & (threshold_bin_idx >= 0) & (final_bin_size <= FINAL_SORT_ITEMS)
     if use_final:
         tl.store(s_final_cnt_ptr, 0)
-    if (step_idx < 3) & (~use_final):
-        tl.store(s_cand_out_count_ptr, 0)
+    if (step_idx == 0) & (~use_final):
+        tl.store(s_cand_count_ptr, 0)
 
     if False:
         if step_idx < 3:
@@ -914,17 +930,17 @@ def processHistogramStep_compact(
             need_final_sort = tl.full((), False, dtype=tl.int1)
             continue_to_next_step = tl.full((), False, dtype=tl.int1)
         tl.debug_barrier()
-        return continue_to_next_step, need_final_sort
+        return continue_to_next_step, need_final_sort, logit_pattern
 
     found_ptrs = s_found_topk_values_ptr + zeros
     final_cnt_ptrs = s_final_cnt_ptr + zeros
-    cand_out_cnt_ptrs = s_cand_out_count_ptr + zeros
+    cand_cnt_ptrs = s_cand_count_ptr + zeros
 
     if step_idx == 0:
         if ASSUME_ALIGNED:
             found_ptrs_vec = s_found_topk_values_ptr + zeros_vec_2d
             final_cnt_ptrs_vec = s_final_cnt_ptr + zeros_vec_2d
-            cand_out_cnt_ptrs_vec = s_cand_out_count_ptr + zeros_vec_2d
+            cand_cnt_ptrs_vec = s_cand_count_ptr + zeros_vec_2d
             n_vec_full = seq_len // (BLOCK_SIZE * VEC)
             rem_tiles = (seq_len - n_vec_full * BLOCK_SIZE * VEC) // BLOCK_SIZE
             for t in tl.range(0, n_vec_full):
@@ -985,17 +1001,22 @@ def processHistogramStep_compact(
                         )
                 else:
                     if True:
-                        nxt_pos = tl.atomic_add(
-                            cand_out_cnt_ptrs_vec,
+                        cand_pos = tl.atomic_add(
+                            cand_cnt_ptrs_vec,
                             ones_vec_2d,
                             mask=take_eq,
                             sem="relaxed",
                             scope="cta",
                         )
                         tl.store(
-                            cand_out_ptr + nxt_pos,
+                            cand_idx_ptr + cand_pos,
                             idx,
-                            mask=take_eq & (nxt_pos < CAND_BUF_SIZE),
+                            mask=take_eq & (cand_pos < CAND_BUF_SIZE),
+                        )
+                        tl.store(
+                            cand_val_bits_ptr + cand_pos,
+                            x_vec.to(tl.int32, bitcast=True),
+                            mask=take_eq & (cand_pos < CAND_BUF_SIZE),
                         )
             for t in tl.range(0, rem_tiles):
                 offs = (n_vec_full * VEC + t) * BLOCK_SIZE + lane
@@ -1054,17 +1075,22 @@ def processHistogramStep_compact(
                         )
                 else:
                     if True:
-                        nxt_pos = tl.atomic_add(
-                            cand_out_cnt_ptrs,
+                        cand_pos = tl.atomic_add(
+                            cand_cnt_ptrs,
                             ones,
                             mask=take_eq,
                             sem="relaxed",
                             scope="cta",
                         )
                         tl.store(
-                            cand_out_ptr + nxt_pos,
+                            cand_idx_ptr + cand_pos,
                             idx,
-                            mask=take_eq & (nxt_pos < CAND_BUF_SIZE),
+                            mask=take_eq & (cand_pos < CAND_BUF_SIZE),
+                        )
+                        tl.store(
+                            cand_val_bits_ptr + cand_pos,
+                            x.to(tl.int32, bitcast=True),
+                            mask=take_eq & (cand_pos < CAND_BUF_SIZE),
                         )
         else:
             num_scan_tiles = tl.cdiv(seq_len, BLOCK_SIZE)
@@ -1126,24 +1152,33 @@ def processHistogramStep_compact(
                         )
                 else:
                     if True:
-                        nxt_pos = tl.atomic_add(
-                            cand_out_cnt_ptrs,
+                        cand_pos = tl.atomic_add(
+                            cand_cnt_ptrs,
                             ones,
                             mask=take_eq,
                             sem="relaxed",
                             scope="cta",
                         )
                         tl.store(
-                            cand_out_ptr + nxt_pos,
+                            cand_idx_ptr + cand_pos,
                             idx,
-                            mask=take_eq & (nxt_pos < CAND_BUF_SIZE),
+                            mask=take_eq & (cand_pos < CAND_BUF_SIZE),
+                        )
+                        tl.store(
+                            cand_val_bits_ptr + cand_pos,
+                            x.to(tl.int32, bitcast=True),
+                            mask=take_eq & (cand_pos < CAND_BUF_SIZE),
                         )
     else:
-        for t in tl.range(0, num_in_tiles):
-            pos = t * BLOCK_SIZE + lane
-            valid = pos < cand_in_count
-            idx = tl.load(cand_in_ptr + pos, mask=valid, other=0)
-            x = tl.load(row_ptr + idx * stride_xn, mask=valid, other=float("-inf"))
+        found_ptrs_vec = s_found_topk_values_ptr + zeros_vec_2d
+        final_cnt_ptrs_vec = s_final_cnt_ptr + zeros_vec_2d
+        full_vec_elems = BLOCK_SIZE * VEC
+        num_in_full_vec_tiles = cand_count // full_vec_elems
+        for t in tl.range(0, num_in_full_vec_tiles):
+            pos = t * BLOCK_SIZE * VEC + lane[:, None] * VEC + vec[None, :]
+            idx = tl.load(cand_idx_ptr + pos)
+            x_bits = tl.load(cand_val_bits_ptr + pos)
+            x = x_bits.to(tl.float32, bitcast=True)
             key = _convert_to_trt_uint32(x)
             if step_idx == 1:
                 digit = ((key >> 21) & RADIX11_MASK).to(tl.int32)
@@ -1152,11 +1187,18 @@ def processHistogramStep_compact(
             else:
                 digit = (key & RADIX10_MASK).to(tl.int32)
 
-            take_lt = valid & (digit < threshold_bin_idx)
+            if step_idx == 1:
+                partial = tl.full([BLOCK_SIZE, VEC], True, tl.int1)
+            elif step_idx == 2:
+                partial = ((key ^ logit_pattern) >> 21) == 0
+            else:
+                partial = ((key ^ logit_pattern) >> 10) == 0
+
+            take_lt = partial & (digit < threshold_bin_idx)
             if True:
                 out_pos_lt = tl.atomic_add(
-                    found_ptrs,
-                    ones,
+                    found_ptrs_vec,
+                    ones_vec_2d,
                     mask=take_lt,
                     sem="relaxed",
                     scope="cta",
@@ -1167,12 +1209,12 @@ def processHistogramStep_compact(
                     mask=take_lt & (out_pos_lt < TOPK),
                 )
 
-            take_eq = valid & (digit == threshold_bin_idx)
+            take_eq = partial & (digit == threshold_bin_idx)
             if step_idx == 3:
                 if True:
                     out_pos_eq = tl.atomic_add(
-                        found_ptrs,
-                        ones,
+                        found_ptrs_vec,
+                        ones_vec_2d,
                         mask=take_eq,
                         sem="relaxed",
                         scope="cta",
@@ -1185,8 +1227,8 @@ def processHistogramStep_compact(
             elif use_final:
                 if True:
                     final_pos = tl.atomic_add(
-                        final_cnt_ptrs,
-                        ones,
+                        final_cnt_ptrs_vec,
+                        ones_vec_2d,
                         mask=take_eq,
                         sem="relaxed",
                         scope="cta",
@@ -1198,40 +1240,111 @@ def processHistogramStep_compact(
                     )
                     tl.store(
                         hist_base_ptr + (FINAL_SORT_ITEMS + final_pos),
-                        x.to(tl.int32, bitcast=True),
+                        x_bits,
                         mask=take_eq & (final_pos < FINAL_SORT_ITEMS),
                     )
+
+        rem = cand_count - num_in_full_vec_tiles * full_vec_elems
+        if rem > 0:
+            t = num_in_full_vec_tiles
+            pos = t * BLOCK_SIZE * VEC + lane[:, None] * VEC + vec[None, :]
+            valid = pos < cand_count
+            idx = tl.load(cand_idx_ptr + pos, mask=valid, other=0)
+            x_bits = tl.load(cand_val_bits_ptr + pos, mask=valid, other=0)
+            x = x_bits.to(tl.float32, bitcast=True)
+            key = _convert_to_trt_uint32(x)
+            if step_idx == 1:
+                digit = ((key >> 21) & RADIX11_MASK).to(tl.int32)
+            elif step_idx == 2:
+                digit = ((key >> 10) & RADIX11_MASK).to(tl.int32)
             else:
+                digit = (key & RADIX10_MASK).to(tl.int32)
+
+            if step_idx == 1:
+                partial = valid
+            elif step_idx == 2:
+                partial = valid & (((key ^ logit_pattern) >> 21) == 0)
+            else:
+                partial = valid & (((key ^ logit_pattern) >> 10) == 0)
+
+            take_lt = partial & (digit < threshold_bin_idx)
+            if True:
+                out_pos_lt = tl.atomic_add(
+                    found_ptrs_vec,
+                    ones_vec_2d,
+                    mask=take_lt,
+                    sem="relaxed",
+                    scope="cta",
+                )
+                tl.store(
+                    s_out_indices_ptr + out_pos_lt,
+                    idx.to(tl.int32),
+                    mask=take_lt & (out_pos_lt < TOPK),
+                )
+
+            take_eq = partial & (digit == threshold_bin_idx)
+            if step_idx == 3:
                 if True:
-                    nxt_pos = tl.atomic_add(
-                        cand_out_cnt_ptrs,
-                        ones,
+                    out_pos_eq = tl.atomic_add(
+                        found_ptrs_vec,
+                        ones_vec_2d,
                         mask=take_eq,
                         sem="relaxed",
                         scope="cta",
                     )
                     tl.store(
-                        cand_out_ptr + nxt_pos,
+                        s_out_indices_ptr + out_pos_eq,
                         idx.to(tl.int32),
-                        mask=take_eq & (nxt_pos < CAND_BUF_SIZE),
+                        mask=take_eq & (out_pos_eq < TOPK),
                     )
+            elif use_final:
+                if True:
+                    final_pos = tl.atomic_add(
+                        final_cnt_ptrs_vec,
+                        ones_vec_2d,
+                        mask=take_eq,
+                        sem="relaxed",
+                        scope="cta",
+                    )
+                    tl.store(
+                        hist_base_ptr + final_pos,
+                        idx.to(tl.int32),
+                        mask=take_eq & (final_pos < FINAL_SORT_ITEMS),
+                    )
+                    tl.store(
+                        hist_base_ptr + (FINAL_SORT_ITEMS + final_pos),
+                        x_bits,
+                        mask=take_eq & (final_pos < FINAL_SORT_ITEMS),
+                    )
+
+    if step_idx == 1:
+        valid_threshold = threshold_bin_idx >= 0
+        next_pattern = (threshold_bin_idx.to(tl.uint32) & RADIX11_MASK) << 21
+        logit_pattern = tl.where(valid_threshold, next_pattern, logit_pattern)
+    elif step_idx == 2:
+        valid_threshold = threshold_bin_idx >= 0
+        next_bits = (threshold_bin_idx.to(tl.uint32) & RADIX11_MASK) << 10
+        logit_pattern = tl.where(valid_threshold, logit_pattern | next_bits, logit_pattern)
 
     if step_idx < 3:
         if use_final:
             need_final_sort = tl.full((), True, dtype=tl.int1)
             continue_to_next_step = tl.full((), False, dtype=tl.int1)
-        else:
-            next_cnt = tl.minimum(tl.load(s_cand_out_count_ptr), CAND_BUF_SIZE)
-            tl.store(s_cand_out_count_ptr, next_cnt)
+        elif step_idx == 0:
+            next_cnt = tl.minimum(tl.load(s_cand_count_ptr), CAND_BUF_SIZE)
+            tl.store(s_cand_count_ptr, next_cnt)
             need_final_sort = tl.full((), False, dtype=tl.int1)
             continue_to_next_step = next_cnt > 0
+        else:
+            need_final_sort = tl.full((), False, dtype=tl.int1)
+            continue_to_next_step = tl.load(s_found_topk_values_ptr) < TOPK
     else:
         tl.store(s_found_topk_values_ptr, TOPK)
         need_final_sort = tl.full((), False, dtype=tl.int1)
         continue_to_next_step = tl.full((), False, dtype=tl.int1)
 
     tl.debug_barrier()
-    return continue_to_next_step, need_final_sort
+    return continue_to_next_step, need_final_sort, logit_pattern
 
 
 @triton.jit
@@ -1246,8 +1359,6 @@ def tle_topk_selector_kernel_compact(
     stride_outn,
     seq_len,
     ASSUME_ALIGNED: tl.constexpr,
-    USE_TLE_CUMSUM: tl.constexpr,
-    FORCE_DISABLE_FINAL: tl.constexpr,
     TOPK: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -1326,28 +1437,21 @@ def tle_topk_selector_kernel_compact(
         scope=tle.gpu.smem,
         nv_mma_shared_layout=False,
     )
-    s_cand0 = tle.gpu.alloc(
+    s_cand_idx = tle.gpu.alloc(
         [CAND_BUF_SIZE],
         dtype=tl.int32,
         layout=None,
         scope=tle.gpu.smem,
         nv_mma_shared_layout=False,
     )
-    s_cand1 = tle.gpu.alloc(
+    s_cand_val_bits = tle.gpu.alloc(
         [CAND_BUF_SIZE],
         dtype=tl.int32,
         layout=None,
         scope=tle.gpu.smem,
         nv_mma_shared_layout=False,
     )
-    s_cand_cnt0 = tle.gpu.alloc(
-        [1],
-        dtype=tl.int32,
-        layout=None,
-        scope=tle.gpu.smem,
-        nv_mma_shared_layout=False,
-    )
-    s_cand_cnt1 = tle.gpu.alloc(
+    s_cand_cnt = tle.gpu.alloc(
         [1],
         dtype=tl.int32,
         layout=None,
@@ -1360,17 +1464,15 @@ def tle_topk_selector_kernel_compact(
     s_final_bin_size_ptr = tle.gpu.local_ptr(s_final_bin_size, (0, ))
     s_found_topk_values_ptr = tle.gpu.local_ptr(s_found_topk_values, (0, ))
     s_out_indices_ptr = tle.gpu.local_ptr(s_out_indices, (0, ))
-    s_cand0_ptr = tle.gpu.local_ptr(s_cand0, (0, ))
-    s_cand1_ptr = tle.gpu.local_ptr(s_cand1, (0, ))
-    s_cand_cnt0_ptr = tle.gpu.local_ptr(s_cand_cnt0, (0, ))
-    s_cand_cnt1_ptr = tle.gpu.local_ptr(s_cand_cnt1, (0, ))
+    s_cand_idx_ptr = tle.gpu.local_ptr(s_cand_idx, (0, ))
+    s_cand_val_bits_ptr = tle.gpu.local_ptr(s_cand_val_bits, (0, ))
+    s_cand_cnt_ptr = tle.gpu.local_ptr(s_cand_cnt, (0, ))
 
     tl.store(s_final_cnt_ptr, 0)
     tl.store(s_threshold_bin_idx_ptr, -1)
     tl.store(s_final_bin_size_ptr, 0)
     tl.store(s_found_topk_values_ptr, 0)
-    tl.store(s_cand_cnt0_ptr, 0)
-    tl.store(s_cand_cnt1_ptr, 0)
+    tl.store(s_cand_cnt_ptr, 0)
 
     init_chunks: tl.constexpr = (TOPK + BLOCK_SIZE - 1) // BLOCK_SIZE
     for init_idx in tl.range(0, init_chunks):
@@ -1379,35 +1481,23 @@ def tle_topk_selector_kernel_compact(
 
     need_final_sort = tl.full((), False, dtype=tl.int1)
     continue_to_next_step = tl.full((), True, dtype=tl.int1)
+    logit_pattern = tl.full((), 0, dtype=tl.uint32)
     for step_idx in tl.range(0, 4):
         if continue_to_next_step:
-            if step_idx == 0:
-                cand_in_ptr = s_cand0_ptr
-                cand_out_ptr = s_cand0_ptr
-                cand_in_count = tl.full((), 0, dtype=tl.int32)
-                cand_out_count_ptr = s_cand_cnt0_ptr
-            elif step_idx & 1:
-                cand_in_ptr = s_cand0_ptr
-                cand_out_ptr = s_cand1_ptr
-                cand_in_count = tl.load(s_cand_cnt0_ptr)
-                cand_out_count_ptr = s_cand_cnt1_ptr
-            else:
-                cand_in_ptr = s_cand1_ptr
-                cand_out_ptr = s_cand0_ptr
-                cand_in_count = tl.load(s_cand_cnt1_ptr)
-                cand_out_count_ptr = s_cand_cnt0_ptr
+            cand_count = tl.load(s_cand_cnt_ptr)
             found_topk_values = tl.load(s_found_topk_values_ptr)
-            continue_to_next_step, step_need_final_sort = processHistogramStep_compact(
+            continue_to_next_step, step_need_final_sort, logit_pattern = processHistogramStep_compact(
                 row_ptr,
                 stride_xn,
                 row_start,
                 row_end,
                 seq_len,
                 step_idx,
-                cand_in_ptr,
-                cand_in_count,
-                cand_out_ptr,
-                cand_out_count_ptr,
+                logit_pattern,
+                s_cand_idx_ptr,
+                s_cand_val_bits_ptr,
+                cand_count,
+                s_cand_cnt_ptr,
                 found_topk_values,
                 hist_base_ptr,
                 s_out_indices_ptr,
@@ -1415,8 +1505,6 @@ def tle_topk_selector_kernel_compact(
                 s_found_topk_values_ptr,
                 s_threshold_bin_idx_ptr,
                 s_final_bin_size_ptr,
-                USE_TLE_CUMSUM=USE_TLE_CUMSUM,
-                FORCE_DISABLE_FINAL=FORCE_DISABLE_FINAL,
                 ASSUME_ALIGNED=ASSUME_ALIGNED,
                 TOPK=TOPK,
                 BLOCK_SIZE=BLOCK_SIZE,
@@ -1836,8 +1924,6 @@ def tle_topk_selector(
         out.stride(1),
         seq_len,
         ASSUME_ALIGNED=assume_aligned,
-        USE_TLE_CUMSUM=True,
-        FORCE_DISABLE_FINAL=False,
         TOPK=topk,
         BLOCK_SIZE=tle_block_size,
         num_warps=TLE_FIXED_NUM_WARPS,

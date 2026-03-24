@@ -833,6 +833,7 @@ void populateTleRawPatterns(TritonGPUTypeConverter &typeConverter,
   patterns
       .add<TleDSLRegionOpPattern, GenericOpPattern<tle::LocalPointersOp>,
            GenericOpPattern<tle::RemotePointersOp>,
+           GenericOpPattern<tle::ExclusiveCumsumOp>,
            GenericOpPattern<tle::DistributedBarrierOp>,
            GenericOpPattern<tle::YieldOp>,
            GenericOpPattern<tle::ExtractAllocatedPtrOp>,

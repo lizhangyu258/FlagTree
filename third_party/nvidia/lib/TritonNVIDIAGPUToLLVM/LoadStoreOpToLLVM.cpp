@@ -257,6 +257,17 @@ struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
         typeConverter->convertType(getElementTypeOrSelf(op.getType()));
     unsigned vec = getVectorSize(ptr);
 #ifdef __TLE__
+    auto ptrTensorTy = dyn_cast<RankedTensorType>(ptr.getType());
+    auto ptrElemTy =
+        ptrTensorTy ? dyn_cast<PointerType>(ptrTensorTy.getElementType())
+                    : PointerType();
+    bool isSharedTensorPtr = ptrElemTy && ptrElemTy.getAddressSpace() == 3;
+    if (!llMask && isSharedTensorPtr) {
+      // For TLE local/shared pointer chains, AxisInfo divisibility can be
+      // conservative on packed contiguous lanes. Recover vector width from
+      // the pointer layout as a lower-bound hint.
+      vec = std::max(vec, tte::inferTlePointerLayoutVectorHint(ptr));
+    }
     // remote metadata carriers can pessimize AxisInfo on the load pointer.
     // Reuse the underlying pointer as a hint to recover vector width.
     if (remoteCTAInfo.hasRemoteCTAId() && !llMask) {
