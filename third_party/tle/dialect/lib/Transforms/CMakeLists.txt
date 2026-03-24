@@ -5,6 +5,8 @@ add_triton_library(TritonTLETransforms
   TleInsertLocalPointerBarriers.cpp
   TleOptimizeLocalPointerLoads.cpp
   TleOptimizeLocalPointerStores.cpp
+  TleOptimizeExclusiveCumsumLayouts.cpp
+  TleLowerExclusiveCumsum.cpp
   TleLowerAsyncLoad.cpp
   TleLowerTmaCopy.cpp
   ConvertArgToMemDesc.cpp

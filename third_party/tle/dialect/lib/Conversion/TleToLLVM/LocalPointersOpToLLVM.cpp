@@ -212,9 +212,42 @@ struct LocalPointersOpConversion
           logicalOffsets.push_back({dim, offset});
         LinearLayout sharedLayout = ttg::toLinearLayout(memDescTy);
         sharedLayout = sharedLayout.sublayout({kOffset}, dimNames);
-        elemOffset = applyLinearLayout(loc, rewriter, sharedLayout.invert(),
-                                       logicalOffsets)[0]
-                         .second;
+        LinearLayout invSharedLayout = sharedLayout.invert();
+
+        // Be robust to non-canonical input ordering produced by upstream
+        // transformations: reorder offsets to match the inverted layout's
+        // expected in-dim order before applying the mapping.
+        SmallVector<std::pair<StringAttr, Value>> orderedLogicalOffsets;
+        orderedLogicalOffsets.reserve(invSharedLayout.getNumInDims());
+        for (StringAttr inDim : invSharedLayout.getInDimNames()) {
+          bool found = false;
+          for (auto &logical : logicalOffsets) {
+            if (logical.first == inDim) {
+              orderedLogicalOffsets.push_back(logical);
+              found = true;
+              break;
+            }
+          }
+          if (!found)
+            return reportFailure(
+                "missing logical offset for inverted shared-layout in-dim");
+        }
+
+        auto remappedOffsets = applyLinearLayout(loc, rewriter, invSharedLayout,
+                                                 orderedLogicalOffsets);
+        if (remappedOffsets.empty())
+          return reportFailure("failed to remap shared-memory linear offsets");
+
+        bool foundOffset = false;
+        for (auto &mapped : remappedOffsets) {
+          if (mapped.first == kOffset) {
+            elemOffset = mapped.second;
+            foundOffset = true;
+            break;
+          }
+        }
+        if (!foundOffset)
+          return reportFailure("remapped shared layout does not contain offset");
       }
 
       Value byteOffset = elemOffset;

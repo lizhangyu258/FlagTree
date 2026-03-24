@@ -5,6 +5,7 @@ Top-K with Triton (Radix-Only Tutorial)
 This tutorial implements Top-K over the last dimension of an (M, N) tensor and
 compares:
 - radix: Triton radix-select kernel
+- triton: Triton streaming top-k kernel
 - torch: torch.topk
 """
 
@@ -41,6 +42,18 @@ def key_to_fpval(x):
     tm, fm = get_topmask_and_fullmask(x)
     mask = tl.where((x & tm) != 0, tm, fm)
     return x ^ mask
+
+
+@triton.jit
+def indx_to_key(indx):
+    max_u16 = tl.full(indx.shape, 0xFFFF, dtype=tl.uint32)
+    return max_u16 - indx.to(tl.uint32)
+
+
+@triton.jit
+def key_to_indx(indx_key):
+    max_u16 = tl.full(indx_key.shape, 0xFFFF, dtype=tl.uint32)
+    return (max_u16 - indx_key.to(tl.uint32)).to(tl.int32)
 
 
 @triton.jit
@@ -162,6 +175,61 @@ def topk_kernel_radix_triton(
                 tl.store(yi_ptrs, offs_n.to(tl.int32), mask=write_mask)
 
 
+@triton.jit
+def topk_kernel_streaming_triton(
+    X,
+    Yv,
+    Yi,
+    stride_xm,
+    stride_ym,
+    n_cols,
+    K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    x_dtype: tl.constexpr = X.dtype.element_ty
+    x_nbits: tl.constexpr = x_dtype.primitive_bitwidth
+    x_utype = tl.dtype(f"uint{x_nbits}")
+    if x_nbits < 16:
+        packed_nbits: tl.constexpr = 32
+    else:
+        packed_nbits: tl.constexpr = x_nbits * 2
+    x_packtype = tl.dtype(f"uint{packed_nbits}")
+
+    n_tiles = tl.cdiv(n_cols, BLOCK_N)
+    offs_n = (n_tiles - 1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < n_cols
+
+    x_ptrs = X + pid * stride_xm + offs_n
+    x = tl.load(x_ptrs, mask=mask_n, other=float("-inf"))
+    x_key = fpval_to_key(x.to(x_utype, bitcast=True))
+    x_pack = (x_key.to(x_packtype) << 16) | indx_to_key(offs_n).to(x_packtype)
+    acc = tl.topk(x_pack, K)
+
+    for _ in tl.range(0, n_tiles - 1):
+        acc = tl.bitonic_merge(acc)
+        offs_n -= BLOCK_N
+        x_ptrs = X + pid * stride_xm + offs_n
+        x = tl.load(x_ptrs, mask=tl.full([BLOCK_N], True, tl.int1), other=float("-inf"))
+        x_key = fpval_to_key(x.to(x_utype, bitcast=True))
+        x_pack = (x_key.to(x_packtype) << 16) | indx_to_key(offs_n).to(x_packtype)
+        acc = tl.maximum(acc, tl.topk(x_pack, K))
+
+    # Rotate index-key into high bits, then sort by descending key.
+    acc = (acc << (packed_nbits - 16)) | (acc >> 16)
+    acc = tl.sort(acc, descending=True)
+
+    y_indx_key = (acc >> (packed_nbits - 16)).to(tl.uint32)
+    y_idx = key_to_indx(y_indx_key)
+    y_val_bits = acc.to(x_utype)
+    y_vals = key_to_fpval(y_val_bits).to(x_dtype, bitcast=True)
+
+    offs_k = tl.arange(0, K)
+    tl.store(Yv + pid * stride_ym + offs_k, y_vals)
+    tl.store(Yi + pid * stride_ym + offs_k, y_idx)
+
+
 def triton_radix_topk(
     x: torch.Tensor,
     k: int,
@@ -218,6 +286,58 @@ def triton_radix_topk(
     return y_vals, y_idx
 
 
+def triton_topk(
+    x: torch.Tensor,
+    k: int,
+    out_vals: torch.Tensor | None = None,
+    out_idx: torch.Tensor | None = None,
+):
+    assert x.is_cuda, "input must be on CUDA"
+    assert x.ndim == 2, "input must be 2D (M, N)"
+    n_rows, n_cols = x.shape
+    if k > n_cols:
+        raise ValueError(f"k={k} must be <= N={n_cols}")
+    if n_cols > 65535:
+        raise ValueError(f"triton_topk supports N <= 65535, got N={n_cols}")
+
+    if out_vals is None:
+        y_vals = torch.empty((n_rows, k), device=x.device, dtype=x.dtype)
+    else:
+        y_vals = out_vals
+        assert y_vals.shape == (n_rows, k)
+        assert y_vals.dtype == x.dtype
+        assert y_vals.device == x.device
+    if out_idx is None:
+        y_idx = torch.empty((n_rows, k), device=x.device, dtype=torch.int32)
+    else:
+        y_idx = out_idx
+        assert y_idx.shape == (n_rows, k)
+        assert y_idx.dtype == torch.int32
+        assert y_idx.device == x.device
+
+    block_n = max(32, triton.next_power_of_2(min(n_cols, 1024)))
+    if block_n <= 64:
+        num_warps = 2
+    elif block_n <= 128:
+        num_warps = 4
+    else:
+        num_warps = 8
+
+    topk_kernel_streaming_triton[(n_rows, )](
+        x,
+        y_vals,
+        y_idx,
+        x.stride(0),
+        y_vals.stride(0),
+        n_cols,
+        K=k,
+        BLOCK_N=block_n,
+        num_warps=num_warps,
+        num_stages=1,
+    )
+    return y_vals, y_idx
+
+
 def _get_dtype(name: str):
     name = name.lower()
     if name == "float16":
@@ -233,13 +353,21 @@ def run_correctness(m: int, n: int, k: int, dtype: torch.dtype):
     torch.manual_seed(0)
     x = torch.rand((m, n), device=DEVICE, dtype=dtype)
     t_vals, _ = torch.topk(x, k, dim=1, sorted=False)
-    y_vals, y_idx = triton_radix_topk(x, k)
-    y_vals_sorted = torch.sort(y_vals, dim=1, descending=True).values
     t_vals_sorted = torch.sort(t_vals, dim=1, descending=True).values
-    torch.testing.assert_close(y_vals_sorted, t_vals_sorted, rtol=1e-3, atol=1e-3)
-    gathered = x.gather(1, y_idx.to(torch.int64))
-    torch.testing.assert_close(gathered, y_vals, rtol=1e-3, atol=1e-3)
-    print("Correctness check passed (radix).")
+
+    y_vals_radix, y_idx_radix = triton_radix_topk(x, k)
+    y_vals_radix_sorted = torch.sort(y_vals_radix, dim=1, descending=True).values
+    torch.testing.assert_close(y_vals_radix_sorted, t_vals_sorted, rtol=1e-3, atol=1e-3)
+    gathered_radix = x.gather(1, y_idx_radix.to(torch.int64))
+    torch.testing.assert_close(gathered_radix, y_vals_radix, rtol=1e-3, atol=1e-3)
+
+    y_vals_triton, y_idx_triton = triton_topk(x, k)
+    y_vals_triton_sorted = torch.sort(y_vals_triton, dim=1, descending=True).values
+    torch.testing.assert_close(y_vals_triton_sorted, t_vals_sorted, rtol=1e-3, atol=1e-3)
+    gathered_triton = x.gather(1, y_idx_triton.to(torch.int64))
+    torch.testing.assert_close(gathered_triton, y_vals_triton, rtol=1e-3, atol=1e-3)
+
+    print("Correctness check passed (radix + triton).")
 
 
 if "--only_unit_test" in sys.argv:
@@ -248,9 +376,9 @@ if "--only_unit_test" in sys.argv:
     run_correctness(_args.batch, _args.seq_len, _args.K, _dtype)
     sys.exit(0)
 
-_BENCH_PROVIDERS = ["radix", "torch"]
-_BENCH_NAMES = ["Triton-RadixSelect", "Torch-TopK"]
-_BENCH_STYLES = [("red", "-"), ("orange", "-")]
+_BENCH_PROVIDERS = ["radix", "triton", "torch"]
+_BENCH_NAMES = ["Triton-RadixSelect", "Triton-TopK", "Torch-TopK"]
+_BENCH_STYLES = [("red", "-"), ("blue", "-"), ("orange", "-")]
 
 
 @triton.testing.perf_report(
@@ -268,7 +396,7 @@ _BENCH_STYLES = [("red", "-"), ("orange", "-")]
         line_names=_BENCH_NAMES,
         styles=_BENCH_STYLES,
         ylabel="ms",
-        plot_name="tle-topk-radix-vs-torch",
+        plot_name="tle-topk-radix-vs-triton-vs-torch",
         args={},
     ))
 def benchmark(M, N, K, provider, dtype):
@@ -283,6 +411,17 @@ def benchmark(M, N, K, provider, dtype):
     if provider == "radix":
         def run_kernel():
             triton_radix_topk(x, K, out_vals=y_vals, out_idx=y_idx)
+
+        ms, min_ms, max_ms = triton.testing.do_bench(
+            run_kernel,
+            quantiles=quantiles,
+            warmup=bench_warmup,
+            rep=bench_rep,
+        )
+    elif provider == "triton":
+
+        def run_kernel():
+            triton_topk(x, K, out_vals=y_vals, out_idx=y_idx)
 
         ms, min_ms, max_ms = triton.testing.do_bench(
             run_kernel,

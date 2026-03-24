@@ -80,6 +80,38 @@ def TritonTleOptimizeLocalPointerStores
                            "mlir::triton::tle::TleDialect"];
 }
 
+def TritonTleOptimizeExclusiveCumsumLayouts
+    : Pass<"triton-tle-optimize-exclusive-cumsum-layouts", "mlir::ModuleOp"> {
+  let summary = "fold convert_layout around tle.exclusive_cumsum";
+
+  let description = [{
+    This pass folds patterns of the form:
+      ttg.convert_layout -> tle.exclusive_cumsum -> ttg.convert_layout
+    when the source and sink layouts can be made identical, so the cumsum
+    runs directly on the canonical layout and redundant converts are removed.
+  }];
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::TritonDialect",
+                           "mlir::triton::tle::TleDialect"];
+}
+
+def TritonTleLowerExclusiveCumsum
+    : Pass<"triton-tle-lower-exclusive-cumsum", "mlir::ModuleOp"> {
+  let summary = "lower tle.exclusive_cumsum with a specialized Triton IR pattern";
+
+  let description = [{
+    This pass lowers ``tle.exclusive_cumsum`` into Triton IR with a
+    cumsum-specialized pattern: one ``tt.scan`` for prefix accumulation and an
+    index-select ``tt.reduce`` to extract the tail value used as total sum.
+    This avoids a second add-reduction over the original input.
+  }];
+
+  let dependentDialects = ["mlir::arith::ArithDialect",
+                           "mlir::triton::TritonDialect",
+                           "mlir::triton::tle::TleDialect"];
+}
+
 def TritonTleLowerAsyncLoad : Pass<"triton-tle-lower-async-load", "mlir::ModuleOp"> {
   let summary = "Lower TLE async load operations";
 

@@ -157,6 +157,14 @@ void init_triton_tle_ir(py::module &&m) {
              return self.create<tle::LocalPointersOp>(resultTy, memDesc,
                                                       indices);
            })
+      .def("create_exclusive_cumsum",
+           [](TritonOpBuilder &self, Type exclusiveTy, Type totalTy, Value src,
+              int axis, bool reverse) -> OpState {
+             auto &builder = self.getBuilder();
+             return self.create<tle::ExclusiveCumsumOp>(
+                 TypeRange{exclusiveTy, totalTy}, src,
+                 builder.getI32IntegerAttr(axis), builder.getBoolAttr(reverse));
+           })
       .def("create_distributed_barrier",
            [](TritonOpBuilder &self) -> void {
              self.create<tle::DistributedBarrierOp>(
@@ -239,6 +247,10 @@ void init_triton_tle_passes(py::module &&m) {
                      tle::createTritonTleOptimizeLocalPointerLoads);
   ADD_PASS_WRAPPER_0("add_optimize_local_pointer_stores",
                      tle::createTritonTleOptimizeLocalPointerStores);
+  ADD_PASS_WRAPPER_0("add_optimize_exclusive_cumsum_layouts",
+                     tle::createTritonTleOptimizeExclusiveCumsumLayouts);
+  ADD_PASS_WRAPPER_0("add_lower_exclusive_cumsum",
+                     tle::createTritonTleLowerExclusiveCumsum);
   ADD_PASS_WRAPPER_0("add_lower_async_load",
                      tle::createTritonTleLowerAsyncLoad);
   ADD_PASS_WRAPPER_0("add_lower_tma_copy", tle::createTritonTleLowerTmaCopy);

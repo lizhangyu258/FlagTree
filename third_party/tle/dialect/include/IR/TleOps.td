@@ -30,6 +30,13 @@ def Tle_LocalPointersOp : Tle_Op<"local_pointers",
   let hasVerifier = 1;
 }
 
+def Tle_ExclusiveCumsumOp : Tle_Op<"exclusive_cumsum", [Pure, SameOperandsAndResultEncoding]> {
+  let arguments = (ins TT_Tensor:$src, I32Attr:$axis, BoolAttr:$reverse);
+  let results = (outs TT_Tensor:$exclusive, TT_Type:$total);
+  let assemblyFormat = "$src attr-dict `:` type($src) `->` type($exclusive) `,` type($total)";
+  let hasVerifier = 1;
+}
+
 def Tle_DistributedBarrierOp : Tle_Op<"distributed_barrier",
                                       [MemoryEffects<[MemRead, MemWrite]>]> {
   let arguments = (ins

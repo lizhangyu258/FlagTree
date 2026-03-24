@@ -33,6 +33,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 
 namespace mlir::triton::tle {
@@ -54,6 +55,28 @@ static Value stripConvertLayouts(Value value) {
   while (auto convert = current.getDefiningOp<triton::gpu::ConvertLayoutOp>())
     current = convert.getSrc();
   return current;
+}
+
+static Attribute getStrippedTensorEncoding(Value value) {
+  Value stripped = stripConvertLayouts(value);
+  auto strippedTy = dyn_cast<RankedTensorType>(stripped.getType());
+  if (!strippedTy)
+    return Attribute();
+  return strippedTy.getEncoding();
+}
+
+static bool isConstantLikeTensorValue(Value value) {
+  Value cur = stripConvertLayouts(value);
+  if (!isa<RankedTensorType>(cur.getType()))
+    return false;
+  if (isa_and_nonnull<arith::ConstantOp>(cur.getDefiningOp()))
+    return true;
+  if (auto splat = cur.getDefiningOp<triton::SplatOp>()) {
+    Value src = splat.getSrc();
+    if (isa_and_nonnull<arith::ConstantOp>(src.getDefiningOp()))
+      return true;
+  }
+  return false;
 }
 
 static Value stripIndexValueWrappers(Value value) {
@@ -228,6 +251,50 @@ struct EncodingVote {
   int64_t score;
 };
 
+using CachedConversionKey = std::pair<Value, Attribute>;
+using CachedConversionMap =
+    llvm::DenseMap<CachedConversionKey, SmallVector<Value, 4>>;
+
+static Value getOrCreateCachedConvertLayout(OpBuilder &builder,
+                                            Operation *insertBefore, Value v,
+                                            Attribute encoding,
+                                            CachedConversionMap &cache) {
+  Value stripped = stripConvertLayouts(v);
+  auto strippedTy = dyn_cast<RankedTensorType>(stripped.getType());
+  if (strippedTy && strippedTy.getEncoding() == encoding)
+    return stripped;
+
+  auto vTy = dyn_cast<RankedTensorType>(v.getType());
+  if (!vTy)
+    return v;
+  if (vTy.getEncoding() == encoding)
+    return v;
+
+  CachedConversionKey key{v, encoding};
+  auto it = cache.find(key);
+  if (it != cache.end()) {
+    for (Value candidate : it->second) {
+      Operation *def = candidate.getDefiningOp();
+      if (!def)
+        continue;
+      if (def->getBlock() != insertBefore->getBlock())
+        continue;
+      if (def->isBeforeInBlock(insertBefore))
+        return candidate;
+    }
+  }
+
+  auto convertedTy =
+      RankedTensorType::get(vTy.getShape(), vTy.getElementType(), encoding);
+  OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPoint(insertBefore);
+  auto converted = builder.create<triton::gpu::ConvertLayoutOp>(
+      insertBefore->getLoc(), convertedTy, v);
+  Value convertedValue = converted.getResult();
+  cache[key].push_back(convertedValue);
+  return convertedValue;
+}
+
 static Operation *peelAxisInfoCarrier(Value value) {
   llvm::DenseSet<Value> visited;
   Value current = value;
@@ -273,6 +340,23 @@ static void copyAxisInfoAttrs(Operation *src, Operation *dst) {
 static void
 collectConsumerEncodingVotes(Value root,
                              llvm::SmallVectorImpl<EncodingVote> &votes) {
+  auto rootLocal = stripConvertLayouts(root).getDefiningOp<triton::tle::LocalPointersOp>();
+  bool preferMaskForScalarLocalPointers = false;
+  if (rootLocal) {
+    if (auto memDescTy =
+            dyn_cast<triton::gpu::MemDescType>(rootLocal.getSrc().getType())) {
+      int64_t elemCount = 1;
+      for (int64_t dim : memDescTy.getShape()) {
+        if (dim <= 0) {
+          elemCount = 0;
+          break;
+        }
+        elemCount *= dim;
+      }
+      preferMaskForScalarLocalPointers = (elemCount == 1);
+    }
+  }
+
   llvm::SmallVector<Value> worklist;
   llvm::DenseSet<Value> visited;
   auto enqueue = [&](Value v) {
@@ -291,26 +375,70 @@ collectConsumerEncodingVotes(Value root,
       if (auto load = dyn_cast<triton::LoadOp>(owner)) {
         if (isRewritableFullViewLocalPointerLoad(load))
           continue;
-        auto loadTy = dyn_cast<RankedTensorType>(load.getResult().getType());
-        if (loadTy && loadTy.getEncoding()) {
+        if (Attribute loadEncoding =
+                getStrippedTensorEncoding(load.getResult())) {
           const int64_t depthFactor = 1 + getScfLoopDepth(owner);
           int64_t score = 8 * depthFactor;
           if (valueFeedsDot(load.getResult()))
             score += 128 * depthFactor;
-          votes.push_back({loadTy.getEncoding(), score});
+          votes.push_back({loadEncoding, score});
         }
         continue;
       }
       if (auto store = dyn_cast<triton::StoreOp>(owner)) {
-        auto valueTy = dyn_cast<RankedTensorType>(store.getValue().getType());
-        if (valueTy && valueTy.getEncoding()) {
+        if (Attribute valueEncoding = getStrippedTensorEncoding(store.getValue())) {
           const int64_t depthFactor = 1 + getScfLoopDepth(owner);
           int64_t score = 2 * depthFactor;
           if (Operation *def = store.getValue().getDefiningOp();
               def && isa<triton::DotOpInterface>(def))
             score += 8 * depthFactor;
-          votes.push_back({valueTy.getEncoding(), score});
+          votes.push_back({valueEncoding, score});
         }
+        if (Value mask = store.getMask())
+          if (Attribute maskEncoding = getStrippedTensorEncoding(mask))
+            votes.push_back({maskEncoding, 2 * (1 + getScfLoopDepth(owner))});
+        continue;
+      }
+      if (auto atomic = dyn_cast<triton::AtomicRMWOp>(owner)) {
+        const int64_t depthFactor = 1 + getScfLoopDepth(owner);
+        const int64_t valScore =
+            (preferMaskForScalarLocalPointers ? 8 : 24) * depthFactor;
+        const int64_t maskScoreBase =
+            (preferMaskForScalarLocalPointers ? 48 : 12) * depthFactor;
+        const int64_t resultScore =
+            (preferMaskForScalarLocalPointers ? 0 : 12) * depthFactor;
+        if (Attribute valEncoding = getStrippedTensorEncoding(atomic.getVal()))
+          votes.push_back({valEncoding, valScore});
+        if (Value mask = atomic.getMask()) {
+          if (Attribute maskEncoding = getStrippedTensorEncoding(mask)) {
+            int64_t maskScore = maskScoreBase;
+            if (preferMaskForScalarLocalPointers &&
+                isConstantLikeTensorValue(mask))
+              maskScore = depthFactor;
+            votes.push_back({maskEncoding, maskScore});
+          }
+        }
+        if (resultScore > 0)
+          if (Attribute resultEncoding =
+                  getStrippedTensorEncoding(atomic.getResult()))
+            votes.push_back({resultEncoding, resultScore});
+        continue;
+      }
+      if (auto cas = dyn_cast<triton::AtomicCASOp>(owner)) {
+        const int64_t depthFactor = 1 + getScfLoopDepth(owner);
+        const int64_t valScore =
+            (preferMaskForScalarLocalPointers ? 8 : 24) * depthFactor;
+        const int64_t cmpScore =
+            (preferMaskForScalarLocalPointers ? 48 : 12) * depthFactor;
+        const int64_t resultScore =
+            (preferMaskForScalarLocalPointers ? 0 : 12) * depthFactor;
+        if (Attribute cmpEncoding = getStrippedTensorEncoding(cas.getCmp()))
+          votes.push_back({cmpEncoding, cmpScore});
+        if (Attribute valEncoding = getStrippedTensorEncoding(cas.getVal()))
+          votes.push_back({valEncoding, valScore});
+        if (resultScore > 0)
+          if (Attribute resultEncoding = getStrippedTensorEncoding(cas.getResult()))
+            votes.push_back({resultEncoding, resultScore});
         continue;
       }
       if (auto convert = dyn_cast<triton::gpu::ConvertLayoutOp>(owner)) {
@@ -370,11 +498,148 @@ static Attribute pickDominantEncoding(ArrayRef<EncodingVote> votes,
   return best;
 }
 
+static bool isPointerTensorType(Type type) {
+  auto tensorTy = dyn_cast<RankedTensorType>(type);
+  if (!tensorTy)
+    return false;
+  return isa<triton::PointerType>(tensorTy.getElementType());
+}
+
+static void bridgeResultTypeToOldEncoding(Value result, Type oldType,
+                                          OpBuilder &builder) {
+  if (result.getType() == oldType)
+    return;
+  auto oldTensorTy = dyn_cast<RankedTensorType>(oldType);
+  if (!oldTensorTy)
+    return;
+  Operation *def = result.getDefiningOp();
+  if (!def)
+    return;
+  OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPointAfter(def);
+  auto bridge = builder.create<triton::gpu::ConvertLayoutOp>(
+      def->getLoc(), oldTensorTy, result);
+  result.replaceAllUsesExcept(bridge.getResult(), bridge.getOperation());
+}
+
+static bool tryFoldPointerConvertLayout(triton::gpu::ConvertLayoutOp convert,
+                                        OpBuilder &builder,
+                                        CachedConversionMap &cache) {
+  auto srcTy = dyn_cast<RankedTensorType>(convert.getSrc().getType());
+  auto dstTy = dyn_cast<RankedTensorType>(convert.getType());
+  if (!srcTy || !dstTy)
+    return false;
+  if (!isa<triton::PointerType>(srcTy.getElementType()) ||
+      !isa<triton::PointerType>(dstTy.getElementType()))
+    return false;
+
+  Value srcPtr = convert.getSrc();
+  Value convertedPtr = convert.getResult();
+  Attribute srcEncoding = srcTy.getEncoding();
+  auto srcElemTy =
+      cast<triton::PointerType>(srcTy.getElementType()).getPointeeType();
+  auto srcLoadTy =
+      RankedTensorType::get(srcTy.getShape(), srcElemTy, srcEncoding);
+
+  SmallVector<OpOperand *> uses;
+  uses.reserve(convertedPtr.getNumUses());
+  for (OpOperand &use : convertedPtr.getUses()) {
+    Operation *owner = use.getOwner();
+    if (!isa<triton::LoadOp, triton::StoreOp, triton::AtomicRMWOp,
+             triton::AtomicCASOp>(owner))
+      return false;
+    uses.push_back(&use);
+  }
+
+  auto convertOperandEncoding = [&](Operation *insertBefore, Value v,
+                                    Attribute encoding) -> Value {
+    return getOrCreateCachedConvertLayout(builder, insertBefore, v, encoding,
+                                          cache);
+  };
+
+  for (OpOperand *use : uses) {
+    Operation *owner = use->getOwner();
+    use->set(srcPtr);
+
+    if (auto load = dyn_cast<triton::LoadOp>(owner)) {
+      if (Value mask = load.getMask()) {
+        Value convertedMask = convertOperandEncoding(owner, mask, srcEncoding);
+        if (convertedMask != mask)
+          load.getMaskMutable().assign(convertedMask);
+      }
+      if (Value other = load.getOther()) {
+        Value convertedOther =
+            convertOperandEncoding(owner, other, srcEncoding);
+        if (convertedOther != other)
+          load.getOtherMutable().assign(convertedOther);
+      }
+      Type oldType = load.getResult().getType();
+      if (oldType != srcLoadTy) {
+        load.getResult().setType(srcLoadTy);
+        bridgeResultTypeToOldEncoding(load.getResult(), oldType, builder);
+      }
+      continue;
+    }
+
+    if (auto store = dyn_cast<triton::StoreOp>(owner)) {
+      Value value = store.getValue();
+      Value convertedValue = convertOperandEncoding(owner, value, srcEncoding);
+      if (convertedValue != value)
+        store.getValueMutable().assign(convertedValue);
+      if (Value mask = store.getMask()) {
+        Value convertedMask = convertOperandEncoding(owner, mask, srcEncoding);
+        if (convertedMask != mask)
+          store.getMaskMutable().assign(convertedMask);
+      }
+      continue;
+    }
+
+    if (auto atomic = dyn_cast<triton::AtomicRMWOp>(owner)) {
+      Value val = atomic.getVal();
+      Value convertedVal = convertOperandEncoding(owner, val, srcEncoding);
+      if (convertedVal != val)
+        atomic.getValMutable().assign(convertedVal);
+      if (Value mask = atomic.getMask()) {
+        Value convertedMask = convertOperandEncoding(owner, mask, srcEncoding);
+        if (convertedMask != mask)
+          atomic.getMaskMutable().assign(convertedMask);
+      }
+      Type oldType = atomic.getResult().getType();
+      if (oldType != srcLoadTy) {
+        atomic.getResult().setType(srcLoadTy);
+        bridgeResultTypeToOldEncoding(atomic.getResult(), oldType, builder);
+      }
+      continue;
+    }
+
+    auto cas = cast<triton::AtomicCASOp>(owner);
+    Value cmp = cas.getCmp();
+    Value convertedCmp = convertOperandEncoding(owner, cmp, srcEncoding);
+    if (convertedCmp != cmp)
+      cas.getCmpMutable().assign(convertedCmp);
+    Value val = cas.getVal();
+    Value convertedVal = convertOperandEncoding(owner, val, srcEncoding);
+    if (convertedVal != val)
+      cas.getValMutable().assign(convertedVal);
+    Type oldType = cas.getResult().getType();
+    if (oldType != srcLoadTy) {
+      cas.getResult().setType(srcLoadTy);
+      bridgeResultTypeToOldEncoding(cas.getResult(), oldType, builder);
+    }
+  }
+
+  if (convertedPtr.use_empty())
+    convert.erase();
+  return true;
+}
+
 class SelectEncodingsPass
     : public impl::TritonTleSelectEncodingsBase<SelectEncodingsPass> {
   void runOnOperation() override {
     ModuleOp module = getOperation();
     OpBuilder builder(module.getContext());
+    CachedConversionMap userOperandConversionCache;
+    CachedConversionMap indexOperandConversionCache;
     module.walk([&](triton::tle::LocalPointersOp op) {
       // Always tag local pointer ops so barrier insertion can track hazards
       // across different pointer views of the same alloc.
@@ -408,6 +673,32 @@ class SelectEncodingsPass
       auto encoding = tensorTy.getEncoding();
       SmallVector<EncodingVote> votes;
       collectConsumerEncodingVotes(op.getResult(), votes);
+      for (Value index : op.getIndices()) {
+        Attribute indexEncoding = getStrippedTensorEncoding(index);
+        if (!indexEncoding)
+          continue;
+        const bool constantLike = isConstantLikeTensorValue(index);
+        int64_t elemCount = 1;
+        if (auto indexTy = dyn_cast<RankedTensorType>(index.getType())) {
+          for (int64_t dim : indexTy.getShape()) {
+            if (dim <= 0) {
+              elemCount = 0;
+              break;
+            }
+            elemCount *= dim;
+          }
+        }
+        const int64_t depthFactor = 1 + getScfLoopDepth(op.getOperation());
+        int64_t baseScore = constantLike ? 1 : 12;
+        if (!constantLike) {
+          if (elemCount >= 1024)
+            baseScore = 192;
+          else if (elemCount >= 256)
+            baseScore = 64;
+        }
+        const int64_t score = baseScore * depthFactor;
+        votes.push_back({indexEncoding, score});
+      }
       Attribute userEncoding = pickDominantEncoding(votes, encoding);
       if (userEncoding && userEncoding != encoding) {
         encoding = userEncoding;
@@ -446,18 +737,8 @@ class SelectEncodingsPass
                                               ptrTensorTy.getEncoding());
           auto convertOperandEncoding = [&](Operation *insertBefore, Value v,
                                             Attribute encoding) -> Value {
-            auto vTy = dyn_cast<RankedTensorType>(v.getType());
-            if (!vTy)
-              return v;
-            if (vTy.getEncoding() == encoding)
-              return v;
-            auto convertedTy = RankedTensorType::get(
-                vTy.getShape(), vTy.getElementType(), encoding);
-            OpBuilder::InsertionGuard guard(builder);
-            builder.setInsertionPoint(insertBefore);
-            auto converted = builder.create<triton::gpu::ConvertLayoutOp>(
-                insertBefore->getLoc(), convertedTy, v);
-            return converted.getResult();
+            return getOrCreateCachedConvertLayout(
+                builder, insertBefore, v, encoding, userOperandConversionCache);
           };
           for (OpOperand &use : ptrVal.getUses()) {
             Operation *owner = use.getOwner();
@@ -520,7 +801,19 @@ class SelectEncodingsPass
                 if (convertedMask != mask)
                   atomic.getMaskMutable().assign(convertedMask);
               }
-              atomic.getResult().setType(loadTy);
+              auto oldAtomicTy =
+                  dyn_cast<RankedTensorType>(atomic.getResult().getType());
+              if (oldAtomicTy != loadTy) {
+                atomic.getResult().setType(loadTy);
+                if (oldAtomicTy) {
+                  OpBuilder::InsertionGuard guard(builder);
+                  builder.setInsertionPointAfter(atomic);
+                  auto bridge = builder.create<triton::gpu::ConvertLayoutOp>(
+                      atomic.getLoc(), oldAtomicTy, atomic.getResult());
+                  atomic.getResult().replaceAllUsesExcept(
+                      bridge.getResult(), bridge.getOperation());
+                }
+              }
               continue;
             }
             if (auto cas = dyn_cast<triton::AtomicCASOp>(owner)) {
@@ -534,7 +827,19 @@ class SelectEncodingsPass
                   convertOperandEncoding(owner, val, ptrEncoding);
               if (convertedVal != val)
                 cas.getValMutable().assign(convertedVal);
-              cas.getResult().setType(loadTy);
+              auto oldCasTy =
+                  dyn_cast<RankedTensorType>(cas.getResult().getType());
+              if (oldCasTy != loadTy) {
+                cas.getResult().setType(loadTy);
+                if (oldCasTy) {
+                  OpBuilder::InsertionGuard guard(builder);
+                  builder.setInsertionPointAfter(cas);
+                  auto bridge = builder.create<triton::gpu::ConvertLayoutOp>(
+                      cas.getLoc(), oldCasTy, cas.getResult());
+                  cas.getResult().replaceAllUsesExcept(bridge.getResult(),
+                                                       bridge.getOperation());
+                }
+              }
               continue;
             }
             if (auto remote = dyn_cast<triton::tle::RemotePointersOp>(owner)) {
@@ -567,13 +872,11 @@ class SelectEncodingsPass
             newOperands.push_back(operand);
             continue;
           }
-          auto convertedTy = RankedTensorType::get(operandTy.getShape(),
-                                                   operandTy.getElementType(),
-                                                   desiredEncoding);
-          auto converted = builder.create<triton::gpu::ConvertLayoutOp>(
-              op.getLoc(), convertedTy, operand);
+          auto converted = getOrCreateCachedConvertLayout(
+              builder, op.getOperation(), operand, desiredEncoding,
+              indexOperandConversionCache);
           newOperands.push_back(converted);
-          updatedOperands = true;
+          updatedOperands = (converted != operand) || updatedOperands;
         }
         if (updatedOperands)
           op->setOperands(newOperands);
@@ -587,6 +890,25 @@ class SelectEncodingsPass
       Operation *srcDef = peelAxisInfoCarrier(op.getSrc());
       copyAxisInfoAttrs(srcDef, op.getOperation());
     });
+
+    // Fold pointer convert_layout around local/remote pointer users after
+    // encoding updates to avoid leaving convert chains on ptr tensors.
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      SmallVector<triton::gpu::ConvertLayoutOp> ptrConverts;
+      module.walk([&](triton::gpu::ConvertLayoutOp convert) {
+        if (isPointerTensorType(convert.getType()) &&
+            isPointerTensorType(convert.getSrc().getType()))
+          ptrConverts.push_back(convert);
+      });
+      for (triton::gpu::ConvertLayoutOp convert : ptrConverts) {
+        if (convert->getBlock() == nullptr)
+          continue;
+        changed |= tryFoldPointerConvertLayout(
+            convert, builder, userOperandConversionCache);
+      }
+    }
   }
 
   void tagDependencyGroup(triton::tle::LocalPointersOp op, OpBuilder &builder) {
