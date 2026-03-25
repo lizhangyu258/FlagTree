@@ -69,6 +69,26 @@ def _tle_cumsum_call_shared_kernel(exclusive_ptr, sentinel_ptr, BLOCK: tl.conste
     tl.store(sentinel_ptr + offs, sentinel)
 
 
+@triton.jit
+def _tle_cumsum_scalar_base_addptr_kernel(exclusive_ptr, sentinel_ptr, BLOCK: tl.constexpr):
+    sentinel_value = 123456789
+    offs = tl.arange(0, BLOCK)
+    smem = tle.gpu.alloc([BLOCK * 2], dtype=tl.int32, scope=tle.gpu.smem)
+    base = tle.gpu.local_ptr(smem, (0, ))
+    data_ptrs = base + offs
+    sentinel_ptrs = base + (BLOCK + offs)
+
+    tl.store(data_ptrs, offs + 1)
+    tl.store(sentinel_ptrs, sentinel_value)
+    x = tl.load(data_ptrs)
+    exclusive, _ = tle.cumsum(x, axis=0, reverse=False)
+    tl.store(data_ptrs, exclusive)
+    tl.debug_barrier()
+
+    tl.store(exclusive_ptr + offs, tl.load(data_ptrs))
+    tl.store(sentinel_ptr + offs, tl.load(sentinel_ptrs))
+
+
 def _pick_expected_dtype(input_dtype: torch.dtype) -> torch.dtype:
     if input_dtype in (torch.int8, torch.int16):
         return torch.int32
@@ -203,6 +223,27 @@ def test_tle_cumsum_call_shared_frame_regression():
     assert "tt.call" in ttgir, "regression scenario requires cross-function call frame"
 
     _tle_cumsum_call_shared_kernel[(1, )](
+        exclusive,
+        sentinel,
+        BLOCK=block,
+        num_warps=num_warps,
+        num_stages=1,
+    )
+
+    x = torch.arange(1, block + 1, device="cuda", dtype=torch.int32)
+    expected_exclusive = torch.cumsum(x, dim=0, dtype=torch.int32) - x
+    expected_sentinel = torch.full((block, ), 123456789, device="cuda", dtype=torch.int32)
+    torch.testing.assert_close(exclusive, expected_exclusive)
+    torch.testing.assert_close(sentinel, expected_sentinel)
+
+
+def test_tle_cumsum_scalar_base_addptr_alias_regression():
+    block = 512
+    num_warps = block // 32
+    exclusive = torch.empty((block, ), device="cuda", dtype=torch.int32)
+    sentinel = torch.empty((block, ), device="cuda", dtype=torch.int32)
+
+    _tle_cumsum_scalar_base_addptr_kernel[(1, )](
         exclusive,
         sentinel,
         BLOCK=block,
