@@ -877,7 +877,8 @@ static bool verifyRootLevelLocalStoreCoverage(
   return true;
 }
 
-static bool hasRawPipeProducerCandidate(ArrayRef<Value> roots,
+static bool hasRawPipeProducerCandidate(PipeWriterCommitOp commit,
+                                        ArrayRef<Value> roots,
                                         Operation *windowBegin) {
   llvm::DenseSet<Value> fieldRoots;
   for (Value root : roots)
@@ -1257,7 +1258,8 @@ analyzePipeCommit(PipeWriterCommitOp commit, PipeDefinition &definition) {
     analysis.participantCount =
         inferLocalStoreParticipantCount(commit, *threadCount, *windowBegin);
     if (!analysis.participantCount &&
-        hasRawPipeProducerCandidate(analysis.localStoreRoots, *windowBegin)) {
+        hasRawPipeProducerCandidate(commit, analysis.localStoreRoots,
+                                    *windowBegin)) {
       std::string coverageFailure;
       if (!verifyRootLevelLocalStoreCoverage(
               commit, analysis.localStoreRoots, *windowBegin,

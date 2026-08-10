@@ -645,10 +645,9 @@ void DSLRegionOp::getEffects(
     for (auto indexed : llvm::enumerate(argEffects.asArrayRef())) {
       OpOperand &operand = inputs[indexed.index()];
       int32_t effect = indexed.value();
-      SideEffects::Resource *resource =
-          isa<triton::gpu::MemDescType>(operand.get().getType())
-              ? triton::gpu::SharedMemory::get()
-              : SideEffects::DefaultResource::get();
+      SideEffects::Resource *resource = SideEffects::DefaultResource::get();
+      if (isa<triton::gpu::MemDescType>(operand.get().getType()))
+        resource = triton::gpu::SharedMemory::get();
       if (effect == 1 || effect == 3)
         effects.emplace_back(MemoryEffects::Read::get(), &operand, resource);
       if (effect == 2 || effect == 3)
