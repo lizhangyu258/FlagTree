@@ -23,6 +23,14 @@ from triton.language.core import builtin, constexpr as tl_constexpr, tensor
 from triton.experimental.tle.language.gpu import buffered_tensor
 
 
+_ARG_EFFECT_CODES = {
+    "none": 0,
+    "read": 1,
+    "write": 2,
+    "read_write": 3,
+}
+
+
 def _resolve_alias_indices(func, llvm, handles, output_indices, extern_func_name, _semantic):
     if output_indices is None:
         return _semantic.builder.compute_alias_operand_indices(llvm, handles, extern_func_name)
@@ -60,11 +68,37 @@ def _normalize_hint(hint):
     return str(hint) if hint else ""
 
 
-def _tle_raw_call(func, args, *, output_indices, hint, smem, _semantic, _generator):
+def _normalize_effects(effects, args):
+    while isinstance(effects, tl_constexpr):
+        effects = effects.value
+    if effects is None:
+        return None
+    if not isinstance(effects, (list, tuple, tl.tuple)):
+        raise TypeError("tle_raw.call effects must be a sequence or None")
+    if isinstance(effects, tl.tuple):
+        effects = list(effects.values)
+    else:
+        effects = list(effects)
+    if len(effects) != len(args):
+        raise ValueError(f"tle_raw.call effects must have one entry per argument: got {len(effects)} effects "
+                         f"for {len(args)} arguments")
+    codes = []
+    for index, effect in enumerate(effects):
+        while isinstance(effect, tl_constexpr):
+            effect = effect.value
+        if not isinstance(effect, str) or effect not in _ARG_EFFECT_CODES:
+            allowed = ", ".join(_ARG_EFFECT_CODES)
+            raise ValueError(f"invalid tle_raw.call effect at argument {index}: {effect!r}; expected one of {allowed}")
+        codes.append(_ARG_EFFECT_CODES[effect])
+    return codes
+
+
+def _tle_raw_call(func, args, *, output_indices, hint, effects, smem, _semantic, _generator):
     mark_kernel_init_hook = getattr(func, "mark_kernel_init_hook", None)
     if mark_kernel_init_hook is not None:
         mark_kernel_init_hook(_semantic, _generator)
     hint = _normalize_hint(hint)
+    effect_codes = _normalize_effects(effects, args)
     handles = [arg.handle for arg in args]
     if getattr(func, "deferred", False):
         if output_indices is None:
@@ -79,16 +113,18 @@ def _tle_raw_call(func, args, *, output_indices, hint, smem, _semantic, _generat
         alias_indices = _resolve_alias_indices(func, llvm, handles, output_indices, extern_func_name, _semantic)
         dsl_region_op = func.create_region_by_llvm(_semantic.builder, llvm, handles, alias_indices, hint,
                                                    extern_func_name)
+    if effect_codes is not None:
+        dsl_region_op.set_arg_effects(effect_codes)
     return _wrap_results(args, alias_indices, dsl_region_op, smem=smem)
 
 
 @builtin
-def call(func, args, output_indices=None, hint="", _semantic=None, _generator=None):
-    return _tle_raw_call(func, args, output_indices=output_indices, hint=hint, smem=False, _semantic=_semantic,
-                         _generator=_generator)
+def call(func, args, output_indices=None, hint="", effects=None, _semantic=None, _generator=None):
+    return _tle_raw_call(func, args, output_indices=output_indices, hint=hint, effects=effects, smem=False,
+                         _semantic=_semantic, _generator=_generator)
 
 
 @builtin
-def call_smem(func, args, output_indices=None, hint="", _semantic=None, _generator=None):
-    return _tle_raw_call(func, args, output_indices=output_indices, hint=hint, smem=True, _semantic=_semantic,
-                         _generator=_generator)
+def call_smem(func, args, output_indices=None, hint="", effects=None, _semantic=None, _generator=None):
+    return _tle_raw_call(func, args, output_indices=output_indices, hint=hint, effects=effects, smem=True,
+                         _semantic=_semantic, _generator=_generator)

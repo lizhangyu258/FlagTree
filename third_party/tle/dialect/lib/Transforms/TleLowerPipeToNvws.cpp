@@ -94,6 +94,25 @@ enum class PipeProvenanceKind {
   Escaped,
 };
 
+constexpr llvm::StringLiteral kRawArgEffectsAttr("tle_raw.arg_effects");
+
+static std::optional<Value> getDSLRegionAliasedInput(Value value) {
+  auto result = dyn_cast<OpResult>(value);
+  if (!result)
+    return std::nullopt;
+  auto raw = dyn_cast<DSLRegionOp>(result.getOwner());
+  if (!raw)
+    return std::nullopt;
+  ArrayRef<int32_t> outputIndices = raw.getOutputOperandIndices();
+  unsigned resultNo = result.getResultNumber();
+  if (resultNo >= outputIndices.size())
+    return std::nullopt;
+  int32_t operandNo = outputIndices[resultNo];
+  if (operandNo < 0 || static_cast<unsigned>(operandNo) >= raw.getNumOperands())
+    return std::nullopt;
+  return raw.getOperand(operandNo);
+}
+
 struct ByteRange {
   int64_t offset = 0;
   int64_t size = 0;
@@ -240,6 +259,10 @@ static Value canonicalizePipeField(Value field) {
 static Value getMemDescRoot(Value value) {
   Value current = canonicalizePipeField(value);
   while (true) {
+    if (std::optional<Value> input = getDSLRegionAliasedInput(current)) {
+      current = canonicalizePipeField(*input);
+      continue;
+    }
     if (auto index = current.getDefiningOp<ttg::MemDescIndexOp>()) {
       current = canonicalizePipeField(index.getSrc());
       continue;
@@ -543,6 +566,10 @@ getCommitFieldRootForStore(Value memdesc, PipeWriterCommitOp commit) {
   Value current = canonicalizePipeField(memdesc);
   bool sawStageIndex = false;
   while (true) {
+    if (std::optional<Value> input = getDSLRegionAliasedInput(current)) {
+      current = canonicalizePipeField(*input);
+      continue;
+    }
     if (auto index = current.getDefiningOp<ttg::MemDescIndexOp>()) {
       if (!sameIndexValue(index.getIndex(), commit.getStage()))
         return std::nullopt;
@@ -560,6 +587,23 @@ getCommitFieldRootForStore(Value memdesc, PipeWriterCommitOp commit) {
   if (!sawStageIndex && getPipeCapacity(commit.getOperation()) != 1)
     return std::nullopt;
   return current;
+}
+
+static bool isRawWriteEffect(int32_t effect) {
+  return effect == 2 || effect == 3;
+}
+
+static DenseI32ArrayAttr getRawArgEffects(DSLRegionOp raw) {
+  auto attr = raw->getAttrOfType<DenseI32ArrayAttr>(kRawArgEffectsAttr);
+  if (!attr || attr.asArrayRef().size() != raw.getNumOperands())
+    return {};
+  return attr;
+}
+
+static bool rawOperandTargetsField(Value operand,
+                                   const llvm::DenseSet<Value> &fieldRoots) {
+  return isa<ttg::MemDescType>(operand.getType()) &&
+         fieldRoots.contains(getMemDescRoot(operand));
 }
 
 static bool canInterleaveBeforeLocalStorePipeCommit(Operation *op) {
@@ -624,6 +668,31 @@ static std::optional<int32_t> inferLocalStoreParticipantCountForRoots(
           return std::nullopt;
         participants = participants ? std::max(*participants, *count) : *count;
         storedRoots.insert(*root);
+        sawLocalStore = true;
+      }
+      continue;
+    }
+
+    if (auto raw = dyn_cast<DSLRegionOp>(prev)) {
+      DenseI32ArrayAttr effects = getRawArgEffects(raw);
+      if (!effects)
+        return std::nullopt;
+      bool touchesField = false;
+      for (auto [operand, effect] :
+           llvm::zip(raw.getInputs(), effects.asArrayRef())) {
+        if (!rawOperandTargetsField(operand, fieldRoots))
+          continue;
+        touchesField = true;
+        if (!isRawWriteEffect(effect))
+          return std::nullopt;
+        std::optional<Value> root =
+            getCommitFieldRootForStore(operand, commit);
+        if (!root || !fieldRoots.contains(*root))
+          return std::nullopt;
+        storedRoots.insert(*root);
+      }
+      if (touchesField) {
+        participants = taskThreadCount;
         sawLocalStore = true;
       }
       continue;
@@ -697,6 +766,9 @@ static bool verifyRootLevelLocalStoreCoverage(
 
   llvm::DenseSet<Value> storedRoots;
   CompletedAsyncCopyState completedAsyncCopies;
+  bool sawUncontractedRaw = false;
+  bool sawNonWritingRaw = false;
+  bool sawRawWriteOutsideFields = false;
   for (Operation *prev = commit->getPrevNode(); prev;
        prev = prev->getPrevNode()) {
     if (prev == windowBegin)
@@ -739,6 +811,36 @@ static bool verifyRootLevelLocalStoreCoverage(
       continue;
     }
 
+    if (auto raw = dyn_cast<DSLRegionOp>(prev)) {
+      DenseI32ArrayAttr effects = getRawArgEffects(raw);
+      for (auto indexed : llvm::enumerate(raw.getInputs())) {
+        Value operand = indexed.value();
+        if (!isa<ttg::MemDescType>(operand.getType()))
+          continue;
+        bool targetsField = rawOperandTargetsField(operand, fieldRoots);
+        if (!targetsField) {
+          if (effects &&
+              isRawWriteEffect(effects.asArrayRef()[indexed.index()]))
+            sawRawWriteOutsideFields = true;
+          continue;
+        }
+        if (!effects) {
+          sawUncontractedRaw = true;
+          continue;
+        }
+        if (!isRawWriteEffect(effects.asArrayRef()[indexed.index()])) {
+          sawNonWritingRaw = true;
+          continue;
+        }
+        std::optional<Value> root =
+            getCommitFieldRootForStore(operand, commit);
+        if (!root || !fieldRoots.contains(*root))
+          return fail("raw pipe producer write is not staged for this commit slot");
+        storedRoots.insert(*root);
+      }
+      continue;
+    }
+
     std::optional<LocalStoreTarget> target = getLocalStoreTarget(prev);
     if (target) {
       std::optional<Value> root =
@@ -762,10 +864,43 @@ static bool verifyRootLevelLocalStoreCoverage(
   }
 
   for (Value root : fieldRoots) {
-    if (!storedRoots.contains(root))
+    if (!storedRoots.contains(root)) {
+      if (sawRawWriteOutsideFields)
+        return fail("raw pipe producer write targets a different pipe field");
+      if (sawUncontractedRaw)
+        return fail("raw pipe producer requires explicit tle_raw.arg_effects");
+      if (sawNonWritingRaw)
+        return fail("raw pipe producer slot requires write or read_write effect");
       return fail("missing a local store for at least one non-TMA field");
+    }
   }
   return true;
+}
+
+static bool hasRawPipeProducerCandidate(ArrayRef<Value> roots,
+                                        Operation *windowBegin) {
+  llvm::DenseSet<Value> fieldRoots;
+  for (Value root : roots)
+    fieldRoots.insert(getMemDescRoot(root));
+  for (Operation *prev = commit->getPrevNode(); prev;
+       prev = prev->getPrevNode()) {
+    if (prev == windowBegin)
+      break;
+    auto raw = dyn_cast<DSLRegionOp>(prev);
+    if (!raw)
+      continue;
+    DenseI32ArrayAttr effects = getRawArgEffects(raw);
+    for (auto indexed : llvm::enumerate(raw.getInputs())) {
+      Value operand = indexed.value();
+      if (!isa<ttg::MemDescType>(operand.getType()))
+        continue;
+      if (rawOperandTargetsField(operand, fieldRoots))
+        return true;
+      if (effects && isRawWriteEffect(effects.asArrayRef()[indexed.index()]))
+        return true;
+    }
+  }
+  return false;
 }
 
 // Conservative root-level implementation: accept only whole-field or
@@ -1118,9 +1253,22 @@ analyzePipeCommit(PipeWriterCommitOp commit, PipeDefinition &definition) {
     return failure();
   }
 
-  if (analysis.transport == PipeCommitTransport::LocalStore)
+  if (analysis.transport == PipeCommitTransport::LocalStore) {
     analysis.participantCount =
         inferLocalStoreParticipantCount(commit, *threadCount, *windowBegin);
+    if (!analysis.participantCount &&
+        hasRawPipeProducerCandidate(analysis.localStoreRoots, *windowBegin)) {
+      std::string coverageFailure;
+      if (!verifyRootLevelLocalStoreCoverage(
+              commit, analysis.localStoreRoots, *windowBegin,
+              /*allowedInterleavedTmaRoots=*/nullptr, &coverageFailure)) {
+        commit.emitOpError("raw pipe producer requires proven synchronous "
+                           "writes for every pipe field: ")
+            << coverageFailure;
+        return failure();
+      }
+    }
+  }
   if (analysis.transport == PipeCommitTransport::MixedTmaLocalStore) {
     analysis.participantCount = inferLocalStoreParticipantCountForRoots(
         commit, analysis.localStoreRoots, *threadCount, *windowBegin,

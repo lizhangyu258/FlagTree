@@ -638,9 +638,26 @@ LogicalResult InsertTileOp::verify() {
 void DSLRegionOp::getEffects(
     SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
         &effects) {
-  // TODO: Conservative memory effects on all dsl_region ops so empty deferred
-  // bodies are not DCE'd before materialize lowering exists. Narrow this to
-  // alias operands or deferred-only once materialize is implemented.
+  auto argEffects =
+      (*this)->getAttrOfType<DenseI32ArrayAttr>("tle_raw.arg_effects");
+  if (argEffects && argEffects.asArrayRef().size() == getNumOperands()) {
+    MutableOperandRange inputs = getInputsMutable();
+    for (auto indexed : llvm::enumerate(argEffects.asArrayRef())) {
+      OpOperand &operand = inputs[indexed.index()];
+      int32_t effect = indexed.value();
+      SideEffects::Resource *resource =
+          isa<triton::gpu::MemDescType>(operand.get().getType())
+              ? triton::gpu::SharedMemory::get()
+              : SideEffects::DefaultResource::get();
+      if (effect == 1 || effect == 3)
+        effects.emplace_back(MemoryEffects::Read::get(), &operand, resource);
+      if (effect == 2 || effect == 3)
+        effects.emplace_back(MemoryEffects::Write::get(), &operand, resource);
+    }
+    return;
+  }
+
+  // Calls without an explicit contract retain the legacy conservative effect.
   effects.emplace_back(MemoryEffects::Read::get());
   effects.emplace_back(MemoryEffects::Write::get());
 }
@@ -659,6 +676,15 @@ LogicalResult DSLRegionOp::verify() {
       return emitOpError() << "expects region argument type (" << arg.getType()
                            << ") to match operand type (" << operand.getType()
                            << ")";
+    }
+  }
+  if (auto argEffects =
+          (*this)->getAttrOfType<DenseI32ArrayAttr>("tle_raw.arg_effects")) {
+    if (argEffects.asArrayRef().size() != getNumOperands())
+      return emitOpError("expects tle_raw.arg_effects length to match operands");
+    for (int32_t effect : argEffects.asArrayRef()) {
+      if (effect < 0 || effect > 3)
+        return emitOpError("expects tle_raw.arg_effects values in [0, 3]");
     }
   }
   return success();

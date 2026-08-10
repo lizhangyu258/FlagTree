@@ -111,6 +111,12 @@ public:
           }
           return hasLegalRegions && typeConverter.isLegal(op);
         });
+    // These ops consume values produced by TritonGPU memory/view operations.
+    // Convert both sides together in the main conversion rather than creating
+    // bridge casts while local_alloc and memdesc_index are still legal.
+    addLegalOp<tle::ExtractAllocatedPtrOp, tle::ExtractAlignedPtrOp,
+               tle::ExtractOffsetOp, tle::ExtractSizesOp,
+               tle::ExtractStridesOp, tle::ExtractPtrOp>();
     addLegalOp<tle::RemotePointersOp>();
     // Allow non-TLE ops to remain during this partial conversion.
     markUnknownOpDynamicallyLegal([](Operation *) -> bool { return true; });
@@ -170,8 +176,6 @@ struct ConvertTritonGPUToLLVM
       RewritePatternSet patterns(context);
       mlir::triton::tle::populateDSLRegionOpToLLVMPatterns(typeConverter,
                                                            patterns, benefit);
-      mlir::triton::tle::populateExtractOpToLLVMPatterns(typeConverter,
-                                                         patterns, benefit);
       mlir::triton::tle::populatePackOpToLLVMPatterns(typeConverter, patterns,
                                                       benefit);
       mlir::triton::tle::populateDistributedBarrierOpToLLVMPatterns(
@@ -219,6 +223,8 @@ struct ConvertTritonGPUToLLVM
                                       computeCapability, patterns,
                                       axisInfoAnalysis, benefit);
 #ifdef __TLE__
+    mlir::triton::tle::populateExtractOpToLLVMPatterns(typeConverter, patterns,
+                                                       benefit);
     mlir::triton::tle::populateRemotePointersOpToLLVMPatterns(
         typeConverter, targetInfo, patterns, benefit + 1);
 #endif

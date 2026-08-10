@@ -34,6 +34,7 @@
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Types.h"
+#include "llvm/ADT/STLExtras.h"
 
 namespace mlir::triton::tle {
 #define GEN_PASS_DEF_TLEDSLREGIONINLINE
@@ -67,6 +68,32 @@ LogicalResult
 TleDSLRegionInlineConversion::matchAndRewrite(tle::DSLRegionOp op,
                                               PatternRewriter &rewriter) const {
   IRMapping mapper;
+  auto &blocks = op.getBody().getBlocks();
+  // Eager raw materialization produces a single-block call region. Inline it
+  // directly so memdesc operands remain ordinary SSA values until the main
+  // TritonGPU-to-LLVM conversion lowers their producers and consumers.
+  if (llvm::hasSingleElement(blocks)) {
+    Block &block = blocks.front();
+    for (auto [argument, input] :
+         llvm::zip(block.getArguments(), op.getInputs()))
+      mapper.map(argument, input);
+
+    SmallVector<Value> replacements;
+    rewriter.setInsertionPoint(op);
+    for (Operation &operation : block.getOperations()) {
+      if (auto yieldOp = dyn_cast<tle::YieldOp>(operation)) {
+        replacements = llvm::map_to_vector(
+            yieldOp.getOperands(), [&mapper](Value value) {
+              return mapper.lookupOrDefault(value);
+            });
+        continue;
+      }
+      rewriter.clone(operation, mapper);
+    }
+    rewriter.replaceOp(op, replacements);
+    return success();
+  }
+
   Block *parent = op->getBlock(),
         *continuation = rewriter.splitBlock(parent, op->getIterator());
   continuation->addArguments(
@@ -76,8 +103,6 @@ TleDSLRegionInlineConversion::matchAndRewrite(tle::DSLRegionOp op,
        llvm::zip(op.getResults(), continuation->getArguments())) {
     rewriter.replaceAllUsesWith(oldResult, newArg);
   }
-  auto &blocks = op.getBody().getBlocks();
-  const size_t blockNum = blocks.size();
   SmallVector<Block *> newBlocks;
   for (auto [idx, block] : llvm::enumerate(blocks)) {
     auto locs = llvm::map_range(

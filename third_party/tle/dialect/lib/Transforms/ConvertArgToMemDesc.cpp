@@ -37,6 +37,8 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Types.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/iterator_range.h"
 #include "llvm/Support/Casting.h"
 
@@ -50,6 +52,11 @@ namespace ttg = mlir::triton::gpu;
 namespace tle = mlir::triton::tle;
 
 namespace {
+
+constexpr llvm::StringLiteral
+    kRawArgEffectsAttr("tle_raw.arg_effects");
+constexpr llvm::StringLiteral
+    kRawArgBarrierInsertedAttr("tle_raw.arg_barrier_inserted");
 
 ttg::MemDescType getPlainMemDesc(RankedTensorType ty) {
   ttg::CTAEncodingAttr ctaLayout = ttg::getCTALayout(ty.getEncoding());
@@ -84,10 +91,35 @@ TleArgConversion::TleArgConversion(MLIRContext *context)
 LogicalResult
 TleArgConversion::matchAndRewrite(tle::DSLRegionOp op,
                                   PatternRewriter &rewriter) const {
+  bool hasConversion = llvm::any_of(op->getOperandTypes(), [](Type type) {
+    return isa<RankedTensorType>(type);
+  });
+  hasConversion |= llvm::any_of(op->getResultTypes(), [](Type type) {
+    return isa<RankedTensorType>(type);
+  });
+  bool hasDirectMemDesc = llvm::any_of(op->getOperandTypes(), [](Type type) {
+    return isa<ttg::MemDescType>(type);
+  });
+  bool hasExplicitEffects = op->hasAttr(kRawArgEffectsAttr);
+  bool needsLegacyMemDescBarrier =
+      hasDirectMemDesc && !hasExplicitEffects &&
+      !op->hasAttr(kRawArgBarrierInsertedAttr);
+
+  if (!hasConversion) {
+    if (!needsLegacyMemDescBarrier)
+      return failure();
+    PatternRewriter::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPoint(op);
+    rewriter.create<NVVM::Barrier0Op>(op.getLoc());
+    rewriter.modifyOpInPlace(op, [&] {
+      op->setAttr(kRawArgBarrierInsertedAttr, rewriter.getUnitAttr());
+    });
+    return success();
+  }
+
   SmallVector<Value> newOperands;
   IRMapping mapper;
-  bool hasConversion = false;
-  bool needSync = false;
+  bool needSync = needsLegacyMemDescBarrier;
   for (const auto &operand : op->getOperands()) {
     if (RankedTensorType tensorTy =
             dyn_cast<RankedTensorType>(operand.getType())) {
@@ -101,12 +133,8 @@ TleArgConversion::matchAndRewrite(tle::DSLRegionOp op,
 
       newOperands.push_back(allocOp);
       mapper.map(operand, allocOp);
-      hasConversion = true;
       needSync = true;
     } else {
-      if (isa<ttg::MemDescType>(operand.getType())) {
-        needSync = true;
-      }
       newOperands.push_back(operand);
     }
   }
@@ -120,19 +148,17 @@ TleArgConversion::matchAndRewrite(tle::DSLRegionOp op,
     if (RankedTensorType tensorTy =
             dyn_cast<RankedTensorType>(result.getType())) {
       newRetTys.push_back(getPlainMemDesc(tensorTy));
-      hasConversion = true;
     } else {
       newRetTys.push_back(result.getType());
     }
-  }
-  if (!hasConversion) {
-    return failure();
   }
   tle::DSLRegionOp newOp = rewriter.create<tle::DSLRegionOp>(
       op.getLoc(), newRetTys, newOperands, op.getRegionDialectAttr(),
       op.getArgDialectAttr(), op.getOutputOperandIndicesAttr(),
       op->getAttrOfType<StringAttr>("hint"));
   newOp->setAttrs(op->getAttrs());
+  if (needSync)
+    newOp->setAttr(kRawArgBarrierInsertedAttr, rewriter.getUnitAttr());
   PatternRewriter::InsertionGuard guard(rewriter);
   for (auto [idx, oldBlock] : llvm::enumerate(op.getBody().getBlocks())) {
     Block *newBlock = nullptr;

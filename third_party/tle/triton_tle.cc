@@ -729,6 +729,11 @@ void init_tle_raw_ir(py::module &&m) {
                                          results_range.end());
           },
           ret::reference)
+      .def("set_arg_effects",
+           [](tle::DSLRegionOp &op, const std::vector<int32_t> &effects) {
+             op->setAttr("tle_raw.arg_effects",
+                         DenseI32ArrayAttr::get(op.getContext(), effects));
+           })
       .def("dump", &tle::DSLRegionOp::dump);
 
   py::class_<tle::YieldOp>(m, "YieldOp", py::module_local(), py::dynamic_attr())
