@@ -72,7 +72,9 @@ def _tle_raw_call(func, args, *, output_indices, hint, smem, _semantic: TLESeman
     if mark_kernel_init_hook is not None:
         mark_kernel_init_hook(_semantic, _generator)
     hint = _normalize_hint(hint)
-    handles = [arg.handle for arg in args]
+    # constexpr values only exist in the Python frontend. Materialize them as
+    # scalar IR values before passing the operands to the raw region.
+    handles = [(_semantic.to_tensor(arg) if isinstance(arg, tl_constexpr) else arg).handle for arg in args]
     if getattr(func, "deferred", False):
         if output_indices is None:
             raise RuntimeError("deferred tle_raw.call requires explicit output_indices=")
