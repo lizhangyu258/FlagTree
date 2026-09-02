@@ -33,10 +33,12 @@
 #include "tle/dialect/include/IR/Dialect.h"
 #include "tle/dialect/include/Transforms/Passes.h"
 #include "tle/dialect/include/Transforms/TleUtility.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Types.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/iterator_range.h"
 #include "llvm/Support/Casting.h"
 
@@ -63,6 +65,44 @@ ttg::MemDescType getPlainMemDesc(RankedTensorType ty) {
                                true);
 }
 
+Value stripConvertLayouts(Value value) {
+  while (auto convert = value.getDefiningOp<ttg::ConvertLayoutOp>())
+    value = convert.getSrc();
+  return value;
+}
+
+// Recover an existing full-tile shared-memory descriptor from a tensor read.
+// Keep this deliberately narrow: arbitrary local-pointer indices and masked
+// loads do not necessarily describe the complete backing memdesc.
+Value getReusableMemDesc(Value value, RankedTensorType tensorTy) {
+  Value source = stripConvertLayouts(value);
+  if (auto localLoad = source.getDefiningOp<ttg::LocalLoadOp>()) {
+    auto memDescTy = dyn_cast<ttg::MemDescType>(localLoad.getSrc().getType());
+    if (memDescTy && memDescTy.getShape() == tensorTy.getShape() &&
+        memDescTy.getElementType() == tensorTy.getElementType())
+      return localLoad.getSrc();
+    return {};
+  }
+
+  if (auto load = source.getDefiningOp<triton::LoadOp>()) {
+    if (load.getMask() || load.getIsVolatile())
+      return {};
+
+    auto localPointers = stripConvertLayouts(load.getPtr())
+                             .getDefiningOp<tle::LocalPointersOp>();
+    if (!localPointers || !localPointers.getIndices().empty())
+      return {};
+
+    auto memDescTy =
+        dyn_cast<ttg::MemDescType>(localPointers.getSrc().getType());
+    if (memDescTy && memDescTy.getShape() == tensorTy.getShape() &&
+        memDescTy.getElementType() == tensorTy.getElementType())
+      return localPointers.getSrc();
+  }
+
+  return {};
+}
+
 struct TleArgConversion : public OpRewritePattern<tle::DSLRegionOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -84,13 +124,27 @@ TleArgConversion::TleArgConversion(MLIRContext *context)
 LogicalResult
 TleArgConversion::matchAndRewrite(tle::DSLRegionOp op,
                                   PatternRewriter &rewriter) const {
+  bool hasConversion = false;
+  for (Type type : op->getOperandTypes())
+    hasConversion |= isa<RankedTensorType>(type);
+  for (Type type : op->getResultTypes())
+    hasConversion |= isa<RankedTensorType>(type);
+  if (!hasConversion)
+    return failure();
+
   SmallVector<Value> newOperands;
   IRMapping mapper;
-  bool hasConversion = false;
   bool needSync = false;
   for (const auto &operand : op->getOperands()) {
     if (RankedTensorType tensorTy =
             dyn_cast<RankedTensorType>(operand.getType())) {
+      if (Value memDesc = getReusableMemDesc(operand, tensorTy)) {
+        newOperands.push_back(memDesc);
+        mapper.map(operand, memDesc);
+        needSync = true;
+        continue;
+      }
+
       PatternRewriter::InsertionGuard guard(rewriter);
       rewriter.setInsertionPoint(op);
       ttg::LocalAllocOp allocOp = rewriter.create<ttg::LocalAllocOp>(
@@ -101,7 +155,6 @@ TleArgConversion::matchAndRewrite(tle::DSLRegionOp op,
 
       newOperands.push_back(allocOp);
       mapper.map(operand, allocOp);
-      hasConversion = true;
       needSync = true;
     } else {
       if (isa<ttg::MemDescType>(operand.getType())) {
@@ -116,17 +169,22 @@ TleArgConversion::matchAndRewrite(tle::DSLRegionOp op,
     rewriter.create<NVVM::Barrier0Op>(op.getLoc());
   }
   SmallVector<Type> newRetTys;
-  for (auto result : op.getResults()) {
+  auto outputIndices = op.getOutputOperandIndices();
+  for (auto [resultIdx, result] : llvm::enumerate(op.getResults())) {
     if (RankedTensorType tensorTy =
             dyn_cast<RankedTensorType>(result.getType())) {
-      newRetTys.push_back(getPlainMemDesc(tensorTy));
-      hasConversion = true;
+      Type resultTy = getPlainMemDesc(tensorTy);
+      if (resultIdx < outputIndices.size()) {
+        int64_t operandIdx = outputIndices[resultIdx];
+        if (operandIdx >= 0 &&
+            operandIdx < static_cast<int64_t>(newOperands.size()) &&
+            isa<ttg::MemDescType>(newOperands[operandIdx].getType()))
+          resultTy = newOperands[operandIdx].getType();
+      }
+      newRetTys.push_back(resultTy);
     } else {
       newRetTys.push_back(result.getType());
     }
-  }
-  if (!hasConversion) {
-    return failure();
   }
   tle::DSLRegionOp newOp = rewriter.create<tle::DSLRegionOp>(
       op.getLoc(), newRetTys, newOperands, op.getRegionDialectAttr(),
@@ -134,6 +192,16 @@ TleArgConversion::matchAndRewrite(tle::DSLRegionOp op,
       op->getAttrOfType<StringAttr>("hint"));
   newOp->setAttrs(op->getAttrs());
   PatternRewriter::InsertionGuard guard(rewriter);
+  DenseMap<Value, Type> yieldedTypes;
+  for (Block &block : op.getBody()) {
+    auto yield = dyn_cast<tle::YieldOp>(block.getTerminator());
+    if (!yield)
+      continue;
+    for (auto [idx, value] : llvm::enumerate(yield.getInputs())) {
+      if (idx < newRetTys.size())
+        yieldedTypes[value] = newRetTys[idx];
+    }
+  }
   for (auto [idx, oldBlock] : llvm::enumerate(op.getBody().getBlocks())) {
     Block *newBlock = nullptr;
     if (idx == 0) {
@@ -158,9 +226,12 @@ TleArgConversion::matchAndRewrite(tle::DSLRegionOp op,
       if (tle::PackOp packOp = dyn_cast<tle::PackOp>(operation)) {
         if (auto tensorTy =
                 dyn_cast<RankedTensorType>(packOp.getOutput().getType())) {
+          Type packTy = getPlainMemDesc(tensorTy);
+          if (auto it = yieldedTypes.find(packOp.getOutput());
+              it != yieldedTypes.end())
+            packTy = it->second;
           tle::PackOp newPackOp = rewriter.create<tle::PackOp>(
-              packOp.getLoc(), getPlainMemDesc(tensorTy),
-              mapper.lookup(packOp.getInput()));
+              packOp.getLoc(), packTy, mapper.lookup(packOp.getInput()));
           mapper.map(packOp.getOutput(), newPackOp.getOutput());
           continue;
         }

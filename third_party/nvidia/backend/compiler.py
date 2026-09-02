@@ -302,8 +302,8 @@ class CUDABackend(BaseBackend):
             tle.passes.add_params_for_distribution(pm)
         passes.ttir.add_convert_to_ttgpuir(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas)
         # flagtree tle raw
-        tle.raw_passes.add_tle_convert_arg_to_memdesc(pm)
-        tle.raw_passes.add_tle_remove_redundant_copy(pm)
+        # tle.raw_passes.add_tle_convert_arg_to_memdesc(pm)
+        # tle.raw_passes.add_tle_remove_redundant_copy(pm)
         # flagtree tle: lower tle.extract_tile
         tle.passes.add_lower_extract_tile(pm)
         # flagtree tle: lower tle.insert_tile
@@ -387,6 +387,9 @@ class CUDABackend(BaseBackend):
             nvidia.passes.ttnvgpuir.add_remove_tmem_tokens(pm)
         else:
             passes.ttir.add_triton_licm(pm)
+        # flagtree tle raw
+        tle.raw_passes.add_tle_convert_arg_to_memdesc(pm)
+        tle.raw_passes.add_tle_remove_redundant_copy(pm)
         passes.common.add_canonicalizer(pm)
         passes.ttir.add_loop_aware_cse(pm)
         passes.ttgpuir.add_prefetch(pm)
