@@ -329,6 +329,8 @@ static bool isBarrierLikeOp(Operation *op) {
     return true;
   if (opName == "tle.distributed_barrier")
     return true;
+  if (opName == "nvvm.barrier0")
+    return true;
   return false;
 }
 

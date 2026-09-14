@@ -46,6 +46,11 @@ static const char *kLoopClusterAttrName = "loop.cluster";
 static const char *kScheduledMaxStageAttrName = "tt.scheduled_max_stage";
 class CoarseSchedule;
 class ModuleAxisInfoAnalysis;
+
+#ifdef __TLE__
+// Raw calls opt into synchronous producer scheduling through their hint.
+bool isTleRawPipelineOp(Operation *op);
+#endif
 //===----------------------------------------------------------------------===//
 // Hoisting Utilities
 //===----------------------------------------------------------------------===//

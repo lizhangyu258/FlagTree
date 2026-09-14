@@ -57,6 +57,16 @@ namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
 namespace ttng = mlir::triton::nvidia_gpu;
 
+#ifdef __TLE__
+bool triton::isTleRawPipelineOp(Operation *op) {
+  if (isa<tt::tle::DSLRegionOp>(op)) {
+    auto hint = op->getAttrOfType<StringAttr>("hint");
+    return hint && hint.getValue() == "pipeline";
+  }
+  return false;
+}
+#endif
+
 //===----------------------------------------------------------------------===//
 // Hoisting Utilities
 //===----------------------------------------------------------------------===//
@@ -225,6 +235,34 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
   OpBuilder::InsertionGuard guard(rewriter);
 #ifdef __TLE__
   if (!isConstantIntValue(pred, 1)) {
+    if (isTleRawPipelineOp(op)) {
+      auto raw = cast<tt::tle::DSLRegionOp>(op);
+      rewriter.setInsertionPoint(raw);
+      if (llvm::all_of(raw->getResults(),
+                       [](Value result) { return result.use_empty(); })) {
+        auto ifOp = scf::IfOp::create(rewriter, raw.getLoc(), TypeRange{}, pred,
+                                      /*withElseRegion=*/false);
+        raw->moveBefore(ifOp.thenBlock(), ifOp.thenBlock()->begin());
+        return ifOp;
+      }
+      auto ifOp =
+          scf::IfOp::create(rewriter, raw.getLoc(), raw->getResultTypes(), pred,
+                            /*withElseRegion=*/true);
+      auto thenBuilder = ifOp.getThenBodyBuilder();
+      auto yield =
+          scf::YieldOp::create(thenBuilder, raw.getLoc(), raw->getResults());
+      raw->moveBefore(yield);
+      SmallVector<Value> outputs;
+      for (int index : raw.getOutputOperandIndices())
+        outputs.push_back(raw.getOperand(index));
+      auto elseBuilder = ifOp.getElseBodyBuilder();
+      scf::YieldOp::create(elseBuilder, raw.getLoc(), outputs);
+      for (auto [oldResult, newResult] :
+           llvm::zip(raw->getResults(), ifOp->getResults()))
+        oldResult.replaceUsesWithIf(
+            newResult, [&](OpOperand &use) { return use.getOwner() != yield; });
+      return ifOp;
+    }
     if (auto dotOp = dyn_cast<ttng::WarpGroupDotOp>(op))
       return predicateWarpGroupDotWithIf(rewriter, dotOp, pred);
   }
@@ -242,7 +280,8 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
   if (isa<ttg::AsyncCommitGroupOp, ttg::AsyncWaitOp>(op))
     return op;
 #ifdef __TLE__
-  if (op->getName().getStringRef() == "tle.distributed_barrier")
+  StringRef opName = op->getName().getStringRef();
+  if (opName == "tle.distributed_barrier" || opName == "nvvm.barrier0")
     return op;
 #endif
   if (op->hasTrait<OpTrait::LocalLoadTrait>())

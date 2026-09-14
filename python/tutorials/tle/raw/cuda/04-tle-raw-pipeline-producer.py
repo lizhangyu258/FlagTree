@@ -83,7 +83,8 @@ def matmul_kernel(
                 pid_n,
                 k,
             ],
-            # output_indices=[0, 1],
+            output_indices=[0, 1],
+            hint="pipeline",
             shared_orders=(
                 tle_raw.shared_order(source=0, order=(1, 0)),
                 tle_raw.shared_order(source=1, order=(1, 0)),

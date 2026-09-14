@@ -24,6 +24,9 @@
  */
 
 #include "mlir/Dialect/UB/IR/UBOps.h"
+#ifdef __TLE__
+#include "tle/dialect/include/IR/Dialect.h"
+#endif
 #include "mlir/IR/Dominance.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "triton/Analysis/AxisInfo.h"
@@ -1105,6 +1108,146 @@ scf::ForOp lowerMMAs(scf::ForOp forOp, CoarseSchedule &schedule) {
 // LOWER LOOP
 /////////////////////////////
 
+#ifdef __TLE__
+scf::ForOp lowerTleRawProducers(scf::ForOp forOp, CoarseSchedule &schedule) {
+  SmallVector<tt::tle::DSLRegionOp> rawOps;
+  for (Operation &op : forOp.getBody()->without_terminator())
+    if (isTleRawPipelineOp(&op))
+      rawOps.push_back(cast<tt::tle::DSLRegionOp>(op));
+  if (rawOps.empty())
+    return forOp;
+
+  auto unsupported = [&](StringRef reason) -> scf::ForOp {
+    forOp.emitError() << "cannot pipeline tle_raw.call(): " << reason;
+    return forOp;
+  };
+
+  struct RawBufferPlan {
+    ttg::LocalAllocOp localAlloc;
+    Operation *firstProducerOp;
+    tt::tle::DSLRegionOp rawOp;
+    SmallVector<ttg::LocalLoadOp> localLoads;
+    int numBuffers;
+    SmallVector<ttg::LocalDeallocOp> localDeallocs;
+  };
+  struct RawBufferIndices {
+    Value insertIdx;
+    Value extractIdx;
+  };
+
+  SmallVector<RawBufferPlan> bufferPlans;
+  llvm::MapVector<int, RawBufferIndices> bufferIndices;
+  for (auto rawOp : rawOps) {
+    int numBuffers = getDefUseStageDiff(rawOp, forOp, schedule);
+    if (numBuffers == 0)
+      return unsupported("shared result has no cross-stage consumer");
+    for (auto [resultIndex, operandIndex] :
+         llvm::enumerate(rawOp.getOutputOperandIndices())) {
+      Value outputOperand = rawOp.getOperand(operandIndex);
+      Value rawResult = rawOp.getResult(resultIndex);
+      SmallVector<ttg::LocalLoadOp> localLoads;
+      for (Operation *user : rawResult.getUsers())
+        localLoads.push_back(cast<ttg::LocalLoadOp>(user));
+
+      auto localAlloc = outputOperand.getDefiningOp<ttg::LocalAllocOp>();
+      Operation *firstProducerOp = rawOp;
+      SmallVector<ttg::LocalDeallocOp> localDeallocs;
+      for (Operation *user : outputOperand.getUsers()) {
+        if (auto localDealloc = dyn_cast<ttg::LocalDeallocOp>(user)) {
+          localDeallocs.push_back(localDealloc);
+          continue;
+        }
+
+        if (user == rawOp)
+          continue;
+
+        auto store = dyn_cast<ttg::LocalStoreOp>(user);
+        if (!store || user->getBlock() != forOp.getBody() ||
+            !user->isBeforeInBlock(rawOp) || schedule[user] != schedule[rawOp])
+          return unsupported("initialization is not in the producer stage");
+        if (user->isBeforeInBlock(firstProducerOp))
+          firstProducerOp = user;
+      }
+      bufferPlans.push_back({localAlloc, firstProducerOp, rawOp, localLoads,
+                             numBuffers, localDeallocs});
+      bufferIndices.insert({numBuffers, {}});
+    }
+  }
+
+  OpBuilder builder(forOp);
+  builder.setInsertionPoint(forOp);
+  Location loc = forOp.getLoc();
+  Value minusOne = arith::ConstantIntOp::create(builder, loc, -1, 32);
+  Value zero = arith::ConstantIntOp::create(builder, loc, 0, 32);
+  Value one = arith::ConstantIntOp::create(builder, loc, 1, 32);
+  SmallVector<Value> newOperands;
+  unsigned newOperandIndex = forOp.getBody()->getNumArguments();
+  for (auto [_, indices] : bufferIndices) {
+    newOperands.push_back(minusOne); // insertIdx
+    newOperands.push_back(minusOne); // extractIdx
+  }
+
+  forOp = addIterArgsToLoop(builder, forOp, newOperands);
+  auto forYield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+  for (Value operand : newOperands)
+    forYield.getResultsMutable().append(operand);
+
+  unsigned argumentIndex = newOperandIndex;
+  for (auto &[numBuffers, indices] : bufferIndices) {
+    Value insertIdx = forOp.getBody()->getArgument(argumentIndex++);
+    Value extractIdx = forOp.getBody()->getArgument(argumentIndex++);
+    builder.setInsertionPoint(forOp.getBody(), forOp.getBody()->begin());
+    Value numBuffersValue =
+        arith::ConstantIntOp::create(builder, loc, numBuffers, 32);
+    indices.insertIdx = createIncrementModulo(builder, loc, insertIdx,
+                                              numBuffersValue, zero, one);
+    indices.extractIdx = createIncrementModulo(builder, loc, extractIdx,
+                                               numBuffersValue, zero, one);
+  }
+
+  for (auto &bufferPlan : bufferPlans) {
+    builder.setInsertionPoint(forOp);
+    auto multiBuffer = ttg::LocalAllocOp::create(
+        builder, bufferPlan.localAlloc.getLoc(),
+        getMultiBufferedType(bufferPlan.localAlloc.getType(),
+                             bufferPlan.numBuffers));
+    builder.setInsertionPointAfter(forOp);
+    ttg::LocalDeallocOp::create(builder, forOp.getLoc(), multiBuffer);
+
+    builder.setInsertionPoint(bufferPlan.firstProducerOp);
+    Value writeView = createSingleBufferView(
+        builder, multiBuffer, bufferIndices[bufferPlan.numBuffers].insertIdx);
+    auto [producerStage, producerCluster] = schedule[bufferPlan.rawOp];
+    schedule.insert(writeView.getDefiningOp(), producerStage, producerCluster);
+
+    for (ttg::LocalLoadOp localLoad : bufferPlan.localLoads) {
+      builder.setInsertionPoint(localLoad);
+      Value readView = createSingleBufferView(
+          builder, multiBuffer,
+          bufferIndices[bufferPlan.numBuffers].extractIdx);
+      auto [consumerStage, consumerCluster] = schedule[localLoad];
+      schedule.insert(readView.getDefiningOp(), consumerStage, consumerCluster);
+      localLoad.getSrcMutable().assign(readView);
+    }
+    for (auto localDealloc : bufferPlan.localDeallocs) {
+      schedule.erase(localDealloc);
+      localDealloc.erase();
+    }
+    bufferPlan.localAlloc.replaceAllUsesWith(writeView);
+    schedule.erase(bufferPlan.localAlloc);
+    bufferPlan.localAlloc.erase();
+  }
+
+  unsigned yieldOperandIndex = newOperandIndex - 1;
+  for (auto &[_, indices] : bufferIndices) {
+    forYield.setOperand(yieldOperandIndex++, indices.insertIdx);
+    forYield.setOperand(yieldOperandIndex++, indices.extractIdx);
+  }
+  scheduleDependencies(forOp, schedule);
+  return forOp;
+}
+#endif
+
 void lowerLoop(scf::ForOp forOp,
                triton::ModuleAxisInfoAnalysis &axisInfoAnalysis) {
   CoarseSchedule schedule;
@@ -1112,6 +1255,9 @@ void lowerLoop(scf::ForOp forOp,
     return;
   }
   scf::ForOp newForOp = lowerMMAs(forOp, schedule);
+#ifdef __TLE__
+  newForOp = lowerTleRawProducers(newForOp, schedule);
+#endif
   newForOp = lowerLoads(newForOp, schedule, axisInfoAnalysis);
   newForOp = lowerTMADescriptors(newForOp, schedule);
   schedule.serialize(newForOp);
