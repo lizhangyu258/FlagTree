@@ -53,6 +53,7 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SourceMgr.h"
 #include <cstdint>
+#include <map>
 
 namespace py = pybind11;
 using namespace mlir;
@@ -851,6 +852,17 @@ void init_tle_raw_ir(py::module &&m) {
                                          results_range.end());
           },
           ret::reference)
+      .def("set_shared_orders",
+           [](tle::DSLRegionOp &op,
+              const std::map<int, std::vector<int32_t>> &orders) {
+             Builder builder(op.getContext());
+             SmallVector<NamedAttribute> attrs;
+             for (const auto &[index, order] : orders)
+               attrs.push_back(builder.getNamedAttr(
+                   std::to_string(index), builder.getDenseI32ArrayAttr(order)));
+             op->setAttr("tle.raw.shared_orders",
+                         builder.getDictionaryAttr(attrs));
+           })
       .def("dump", &tle::DSLRegionOp::dump);
 
   py::class_<tle::YieldOp>(m, "YieldOp", py::module_local(), py::dynamic_attr())

@@ -51,16 +51,25 @@ namespace tle = mlir::triton::tle;
 
 namespace {
 
-ttg::MemDescType getPlainMemDesc(RankedTensorType ty) {
+ttg::MemDescType getPlainMemDesc(RankedTensorType ty,
+                                 DenseI32ArrayAttr explicitOrder = {}) {
   ttg::CTAEncodingAttr ctaLayout = ttg::getCTALayout(ty.getEncoding());
-  llvm::iota_range<uint32_t> rOrderRange =
-      llvm::iota_range<uint32_t>(0, ty.getRank(), false);
-  llvm::SmallVector<uint32_t> order = ttg::getOrder(ty);
+  SmallVector<unsigned> order;
+  if (explicitOrder)
+    llvm::append_range(order, explicitOrder.asArrayRef());
+  else
+    order = ttg::getOrder(ty);
   return ttg::MemDescType::get(ty.getShape(), ty.getElementType(),
                                ttg::SwizzledSharedEncodingAttr::get(
                                    ty.getContext(), 1, 1, 1, order, ctaLayout),
                                ttg::SharedMemorySpaceAttr::get(ty.getContext()),
                                true);
+}
+
+DenseI32ArrayAttr getSharedOrder(tle::DSLRegionOp op, unsigned operandIndex) {
+  auto orders = op->getAttrOfType<DictionaryAttr>("tle.raw.shared_orders");
+  return orders ? orders.getAs<DenseI32ArrayAttr>(std::to_string(operandIndex))
+                : DenseI32ArrayAttr();
 }
 
 struct TleArgConversion : public OpRewritePattern<tle::DSLRegionOp> {
@@ -95,13 +104,12 @@ TleArgConversion::matchAndRewrite(tle::DSLRegionOp op,
   SmallVector<Value> newOperands;
   IRMapping mapper;
   bool needSync = false;
-  for (const auto &operand : op->getOperands()) {
-    if (RankedTensorType tensorTy =
-            dyn_cast<RankedTensorType>(operand.getType())) {
+  for (auto [index, operand] : llvm::enumerate(op->getOperands())) {
+    if (auto tensorTy = dyn_cast<RankedTensorType>(operand.getType())) {
       PatternRewriter::InsertionGuard guard(rewriter);
       rewriter.setInsertionPoint(op);
       ttg::LocalAllocOp allocOp = rewriter.create<ttg::LocalAllocOp>(
-          op->getLoc(), getPlainMemDesc(tensorTy));
+          op->getLoc(), getPlainMemDesc(tensorTy, getSharedOrder(op, index)));
       rewriter.create<ttg::LocalStoreOp>(op->getLoc(), operand, allocOp);
       rewriter.setInsertionPointAfter(op);
       rewriter.create<ttg::LocalDeallocOp>(op->getLoc(), allocOp);
@@ -122,13 +130,12 @@ TleArgConversion::matchAndRewrite(tle::DSLRegionOp op,
     rewriter.create<NVVM::Barrier0Op>(op.getLoc());
   }
   SmallVector<Type> newRetTys;
-  for (auto result : op.getResults()) {
-    if (RankedTensorType tensorTy =
-            dyn_cast<RankedTensorType>(result.getType())) {
-      newRetTys.push_back(getPlainMemDesc(tensorTy));
-    } else {
+  for (auto [index, result] : llvm::enumerate(op.getResults())) {
+    if (isa<RankedTensorType>(result.getType()))
+      newRetTys.push_back(
+          newOperands[op.getOutputOperandIndices()[index]].getType());
+    else
       newRetTys.push_back(result.getType());
-    }
   }
   tle::DSLRegionOp newOp = rewriter.create<tle::DSLRegionOp>(
       op.getLoc(), newRetTys, newOperands, op.getRegionDialectAttr(),
@@ -160,9 +167,16 @@ TleArgConversion::matchAndRewrite(tle::DSLRegionOp op,
       if (tle::PackOp packOp = dyn_cast<tle::PackOp>(operation)) {
         if (auto tensorTy =
                 dyn_cast<RankedTensorType>(packOp.getOutput().getType())) {
+          Type packTy = getPlainMemDesc(tensorTy);
+          for (OpOperand &use : packOp.getOutput().getUses()) {
+            if (isa<tle::YieldOp>(use.getOwner()) &&
+                use.getOwner()->getParentOp() == op.getOperation()) {
+              packTy = newRetTys[use.getOperandNumber()];
+              break;
+            }
+          }
           tle::PackOp newPackOp = rewriter.create<tle::PackOp>(
-              packOp.getLoc(), getPlainMemDesc(tensorTy),
-              mapper.lookup(packOp.getInput()));
+              packOp.getLoc(), packTy, mapper.lookup(packOp.getInput()));
           mapper.map(packOp.getOutput(), newPackOp.getOutput());
           continue;
         }

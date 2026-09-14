@@ -61,13 +61,30 @@ def _wrap_results(args, alias_indices, dsl_region_op, *, smem: bool):
     return tl.tuple(tensors)
 
 
+def _normalize_shared_orders(shared_orders):
+
+    def unwrap(value):
+        while isinstance(value, tl_constexpr):
+            value = value.value
+        return value
+
+    shared_orders = unwrap(shared_orders)
+    normalized = {}
+    for entry in shared_orders or ():
+        entry = unwrap(entry)
+        normalized[unwrap(entry["source"])] = [unwrap(axis) for axis in unwrap(entry["order"])]
+    return normalized
+
+
 def _normalize_hint(hint):
     while isinstance(hint, tl_constexpr):
         hint = hint.value
     return str(hint) if hint else ""
 
 
-def _tle_raw_call(func, args, *, output_indices, hint, smem, _semantic: TLESemantic | None, _generator):
+def _tle_raw_call(func, args, *, output_indices, hint, smem, _semantic: TLESemantic | None, _generator,
+                  shared_orders=None):
+    shared_orders = _normalize_shared_orders(shared_orders)
     mark_kernel_init_hook = getattr(func, "mark_kernel_init_hook", None)
     if mark_kernel_init_hook is not None:
         mark_kernel_init_hook(_semantic, _generator)
@@ -88,13 +105,28 @@ def _tle_raw_call(func, args, *, output_indices, hint, smem, _semantic: TLESeman
         alias_indices = _resolve_alias_indices(func, llvm, handles, output_indices, extern_func_name, _semantic)
         dsl_region_op = func.create_region_by_llvm(_semantic.builder, llvm, handles, alias_indices, hint,
                                                    extern_func_name)
+    if shared_orders:
+        dsl_region_op.set_shared_orders(shared_orders)
     return _wrap_results(args, alias_indices, dsl_region_op, smem=smem)
 
 
 @builtin
-def call(func, args, output_indices=None, hint="", _semantic: TLESemantic | None = None, _generator=None):
+def shared_order(*, source, order, _semantic=None):
+    return tl_constexpr({"source": source, "order": order})
+
+
+@builtin
+def call(func, args, output_indices=None, hint="", _semantic: TLESemantic | None = None, _generator=None,
+         shared_orders=None):
+    """Call raw code, optionally selecting plain shared layouts for tensor arguments.
+
+    ``shared_orders`` is a tuple of ``shared_order(source=..., order=...)``
+    entries. Each source selects an index in ``args``; each order lists dimensions
+    fastest first. Raw code must honor the resulting descriptor strides; this
+    option does not change its global-memory indexing or copy direction.
+    """
     return _tle_raw_call(func, args, output_indices=output_indices, hint=hint, smem=False, _semantic=_semantic,
-                         _generator=_generator)
+                         _generator=_generator, shared_orders=shared_orders)
 
 
 @builtin
