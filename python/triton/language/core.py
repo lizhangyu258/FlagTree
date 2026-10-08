@@ -3290,6 +3290,9 @@ class range(base_value):
     :param loop_unroll_factor: Tells the Triton IR level loop unroller how many
         times to unroll a for loop that this range is used with. Less than 2 for
         this value implies no unrolling.
+    :param vector: User promise that iterations are independent and may be
+        reordered. The compiler combines this many iterations into a new
+        leading tensor dimension.
     :param disallow_acc_multi_buffer: If true, prevent the accumulator of the dot
         operation in the loop to be multi-buffered, if applicable.
     :param flatten: automatically flatten the loop nest starting at this loop to
@@ -3309,7 +3312,8 @@ class range(base_value):
     """
 
     def __init__(self, arg1, arg2=None, step=None, num_stages=None, loop_unroll_factor=None,
-                 disallow_acc_multi_buffer=False, flatten=False, warp_specialize=False, disable_licm=False):
+                 disallow_acc_multi_buffer=False, flatten=False, warp_specialize=False, disable_licm=False,
+                 vector=None):
         if step is None:
             self.step = constexpr(1)
         else:
@@ -3326,6 +3330,7 @@ class range(base_value):
         self.flatten = flatten
         self.warp_specialize = warp_specialize
         self.disable_licm = disable_licm
+        self.vector = vector
 
     def __iter__(self):
         raise RuntimeError("tl.range can only be used in @triton.jit'd functions")

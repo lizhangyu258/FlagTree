@@ -92,6 +92,17 @@ def TritonLoopUnroll : Pass</*cli-arg*/"triton-loop-unroll", /*Op*/"mlir::Module
   let dependentDialects = ["mlir::triton::TritonDialect"];
 }
 
+def TritonLoopVectorize : Pass</*cli-arg*/"triton-loop-vectorize", /*Op*/"mlir::ModuleOp"> {
+  let summary = "Directly vectorize loops with an independence contract";
+  let description = [{
+    Rewrites a fully-vectorized scf loop marked by tt.loop_vectorize_factor
+    directly into Triton tensors with a new leading lane dimension. The marker
+    is a user promise that iterations are independent and may be reordered.
+  }];
+  let dependentDialects = ["mlir::arith::ArithDialect",
+                           "mlir::triton::TritonDialect"];
+}
+
 def TritonLoopInvariantCodeMotion : Pass</*cli-arg*/"triton-licm", /*Op*/"mlir::ModuleOp"> {
   let summary = "MLIR's LICM plus hoist load ops out of loops with masks.";
   let description = [{
