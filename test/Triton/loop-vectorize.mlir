@@ -49,9 +49,11 @@ module {
   // CHECK-NOT: tt.loop_unroll_factor
   // CHECK: scf.for
   // CHECK: tt.load {{.*}} : tensor<4x64x!tt.ptr<f32>>
+  // CHECK: math.sqrt {{.*}} : tensor<4x64xf32>
   // CHECK: tt.store {{.*}} : tensor<4x64x!tt.ptr<f32>>
   // CHECK: scf.for
   // CHECK: tt.load {{.*}} : tensor<64x!tt.ptr<f32>>
+  // CHECK: math.sqrt {{.*}} : tensor<64xf32>
   // CHECK: tt.store {{.*}} : tensor<64x!tt.ptr<f32>>
   tt.func public @vectorize_runtime_upper(
       %x: !tt.ptr<f32>, %y: !tt.ptr<f32>, %ub: i32,
@@ -65,11 +67,52 @@ module {
       %xp1 = tt.splat %xp0 : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>>
       %xp = tt.addptr %xp1, %cols : tensor<64x!tt.ptr<f32>>, tensor<64xi32>
       %value = tt.load %xp : tensor<64x!tt.ptr<f32>>
+      %root = math.sqrt %value : tensor<64xf32>
       %yp0 = tt.addptr %y, %offset : !tt.ptr<f32>, i32
       %yp1 = tt.splat %yp0 : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>>
       %yp = tt.addptr %yp1, %cols : tensor<64x!tt.ptr<f32>>, tensor<64xi32>
-      tt.store %yp, %value : tensor<64x!tt.ptr<f32>>
+      tt.store %yp, %root : tensor<64x!tt.ptr<f32>>
     } {tt.loop_vectorize_factor = 4 : i32}
+    tt.return
+  }
+
+  // A per-iteration reduction stays independent in each vector lane.  Its
+  // scalar square root becomes a vector and broadcasts back within each lane.
+  // CHECK-LABEL: @vectorize_sqrt_reduce
+  // CHECK-NOT: scf.for
+  // CHECK: tt.load {{.*}} : tensor<8x64x!tt.ptr<f32>>
+  // CHECK: "tt.reduce"({{.*}}) <{axis = 1 : i32}>
+  // CHECK: math.sqrt {{.*}} : tensor<8xf32>
+  // CHECK: arith.divf {{.*}} : tensor<8x64xf32>
+  // CHECK: tt.store {{.*}} : tensor<8x64x!tt.ptr<f32>>
+  tt.func public @vectorize_sqrt_reduce(%x: !tt.ptr<f32>, %y: !tt.ptr<f32>) {
+    %lb = arith.constant 0 : i32
+    %ub = arith.constant 8 : i32
+    %step = arith.constant 1 : i32
+    %size = arith.constant 64 : i32
+    %eps = arith.constant 1.0e-12 : f32
+    %cols = tt.make_range {start = 0 : i32, end = 64 : i32} : tensor<64xi32>
+    scf.for %i = %lb to %ub step %step : i32 {
+      %offset = arith.muli %i, %size : i32
+      %xp0 = tt.addptr %x, %offset : !tt.ptr<f32>, i32
+      %xp1 = tt.splat %xp0 : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>>
+      %xp = tt.addptr %xp1, %cols : tensor<64x!tt.ptr<f32>>, tensor<64xi32>
+      %value = tt.load %xp : tensor<64x!tt.ptr<f32>>
+      %square = arith.mulf %value, %value : tensor<64xf32>
+      %sum = "tt.reduce"(%square) <{axis = 0 : i32}> ({
+      ^bb0(%lhs: f32, %rhs: f32):
+        %result = arith.addf %lhs, %rhs : f32
+        tt.reduce.return %result : f32
+      }) : (tensor<64xf32>) -> f32
+      %adjusted = arith.addf %sum, %eps : f32
+      %norm = math.sqrt %adjusted : f32
+      %norms = tt.splat %norm : f32 -> tensor<64xf32>
+      %normalized = arith.divf %value, %norms : tensor<64xf32>
+      %yp0 = tt.addptr %y, %offset : !tt.ptr<f32>, i32
+      %yp1 = tt.splat %yp0 : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>>
+      %yp = tt.addptr %yp1, %cols : tensor<64x!tt.ptr<f32>>, tensor<64xi32>
+      tt.store %yp, %normalized : tensor<64x!tt.ptr<f32>>
+    } {tt.loop_vectorize_factor = 8 : i32}
     tt.return
   }
 }

@@ -93,14 +93,13 @@ def TritonLoopUnroll : Pass</*cli-arg*/"triton-loop-unroll", /*Op*/"mlir::Module
 }
 
 def TritonLoopVectorize : Pass</*cli-arg*/"triton-loop-vectorize", /*Op*/"mlir::ModuleOp"> {
-  let summary = "Directly vectorize loops with an independence contract";
+  let summary = "Loop vectorizer";
   let description = [{
-    Rewrites a fully-vectorized scf loop marked by tt.loop_vectorize_factor
-    directly into Triton tensors with a new leading lane dimension. The marker
-    is a user promise that iterations are independent and may be reordered.
+    Combines iterations of scf.for loops marked with tt.loop_vectorize_factor
+    into a new leading tensor dimension.
+    The user must ensure that loop iterations are independent.
   }];
-  let dependentDialects = ["mlir::arith::ArithDialect",
-                           "mlir::triton::TritonDialect"];
+  let dependentDialects = ["mlir::triton::TritonDialect"];
 }
 
 def TritonLoopInvariantCodeMotion : Pass</*cli-arg*/"triton-licm", /*Op*/"mlir::ModuleOp"> {

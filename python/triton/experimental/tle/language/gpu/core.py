@@ -129,11 +129,11 @@ class range(_tl_range):
     :type reorder: bool
     """
 
-    def __init__(self, arg1, arg2=None, step=None, num_stages=None, loop_unroll_factor=None,
+    def __init__(self, arg1, arg2=None, step=None, num_stages=None, loop_unroll_factor=None, loop_vectorize_factor=None,
                  disallow_acc_multi_buffer=False, flatten=False, warp_specialize=False, disable_licm=False,
                  reorder=False):
-        super().__init__(arg1, arg2, step, num_stages, loop_unroll_factor, disallow_acc_multi_buffer, flatten,
-                         warp_specialize, disable_licm)
+        super().__init__(arg1, arg2, step, num_stages, loop_unroll_factor, loop_vectorize_factor,
+                         disallow_acc_multi_buffer, flatten, warp_specialize, disable_licm)
         self.reorder = reorder
 
 

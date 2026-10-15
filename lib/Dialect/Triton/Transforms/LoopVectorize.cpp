@@ -130,8 +130,8 @@ private:
               arith::MulFOp, arith::DivFOp, arith::AddIOp, arith::SubIOp,
               arith::MulIOp, arith::CmpFOp, arith::CmpIOp, arith::SelectOp,
               arith::ExtFOp, arith::TruncFOp, arith::ExtSIOp, arith::ExtUIOp,
-              arith::TruncIOp, arith::UIToFPOp, arith::MaxNumFOp,
-              math::AbsFOp, math::Log2Op, math::CeilOp, math::Exp2Op>(op))
+              arith::TruncIOp, arith::UIToFPOp, arith::MaxNumFOp, math::AbsFOp,
+              math::SqrtOp, math::Log2Op, math::CeilOp, math::Exp2Op>(op))
         continue;
       return failure();
     }
@@ -333,16 +333,16 @@ public:
       OpBuilder builder(loop);
       Location loc = loop.getLoc();
       Value zero = arith::ConstantIntOp::create(builder, loc, 0, 32);
-      Value chunkStep = arith::ConstantIntOp::create(
-          builder, loc, width * *step, 32);
-      Value distance = arith::SubIOp::create(
-          builder, loc, loop.getUpperBound(), loop.getLowerBound());
+      Value chunkStep =
+          arith::ConstantIntOp::create(builder, loc, width * *step, 32);
+      Value distance = arith::SubIOp::create(builder, loc, loop.getUpperBound(),
+                                             loop.getLowerBound());
       Value hasIterations = arith::CmpIOp::create(
           builder, loc, arith::CmpIPredicate::sgt, distance, zero);
-      Value safeDistance = arith::SelectOp::create(
-          builder, loc, hasIterations, distance, zero);
-      Value remainder = arith::RemUIOp::create(builder, loc, safeDistance,
-                                               chunkStep);
+      Value safeDistance =
+          arith::SelectOp::create(builder, loc, hasIterations, distance, zero);
+      Value remainder =
+          arith::RemUIOp::create(builder, loc, safeDistance, chunkStep);
       Value vectorDistance =
           arith::SubIOp::create(builder, loc, safeDistance, remainder);
       Value vectorEnd = arith::AddIOp::create(
