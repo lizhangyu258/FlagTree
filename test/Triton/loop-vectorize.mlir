@@ -1,5 +1,5 @@
-// RUN: triton-opt %s -triton-loop-vectorize -canonicalize | FileCheck %s
-// RUN: triton-opt %s -triton-loop-vectorize -triton-loop-unroll -canonicalize | FileCheck %s
+// RUN: triton-opt %s -triton-loop-vectorize -canonicalize -verify-diagnostics | FileCheck %s
+// RUN: triton-opt %s -triton-loop-vectorize -triton-loop-unroll -canonicalize -verify-diagnostics | FileCheck %s
 
 module {
   // CHECK-LABEL: @vectorize_contract

@@ -40,12 +40,12 @@ ignore = ["E501", "E701", "E731", "E741"]
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401", "E402"]
 
-# flagtree: pyright config for build-tree stubs
-[tool.pyright]
-# Dev-only: scope to the tle package and resolve the compiled _C modules from
-# the build tree (stubs generated at build time; see python/setup_tools/stubgen.py).
-# "lib.current" is a stable symlink created by setup.py pointing to the
-# platform/version-specific build dir (e.g. lib.linux-x86_64-cpython-312).
-include = ["python/triton/experimental/tle"]
-extraPaths = ["build/lib.current", "python"]
-stubPath = "build/lib.current"
+# # flagtree: pyright config for build-tree stubs
+# [tool.pyright]
+# # Dev-only: scope to the tle package and resolve the compiled _C modules from
+# # the build tree (stubs generated at build time; see python/setup_tools/stubgen.py).
+# # "lib.current" is a stable symlink created by setup.py pointing to the
+# # platform/version-specific build dir (e.g. lib.linux-x86_64-cpython-312).
+# include = ["python/triton/experimental/tle"]
+# extraPaths = ["build/lib.current", "python"]
+# stubPath = "build/lib.current"
